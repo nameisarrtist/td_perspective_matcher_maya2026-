@@ -1,220 +1,2354 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+# -*- coding: utf-8 -*-
+"""TD Camera / Perspective Match / Blockout Workspace — Maya 2026 / PySide6.
 
-# C extensions
-*.so
+Install in a Maya scripts directory, then:
+    import td_perspective_matcher_maya2026 as tpm
+    tpm.show()
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+Solves a rectilinear camera's orientation and focal length from orthogonal
+vanishing directions. Translation, scene scale, and lens distortion are NOT
+recoverable from these guides alone. NumPy is optional; OpenCV is not required.
+Includes explicit camera/image-plane inspectors and a manual primitive blockout
+workspace. Calibration JSON stores Match inputs only; save the Maya scene for
+camera rigs, image planes, materials and meshes.
+Maya commands and QPixmap operations remain on the main thread.
+"""
+from __future__ import annotations
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+import json
+import math
+import os
+import sys
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from itertools import combinations
+from pathlib import Path
+from typing import Any
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+import maya.cmds as cmds
+import maya.mel as mel
+import maya.utils
+import maya.OpenMayaUI as omui
+from PySide6 import QtCore, QtGui, QtWidgets
+from shiboken6 import wrapInstance
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-*.lcov
-.hypothesis/
-.pytest_cache/
-cover/
+try:
+    from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
+    HAS_MIXIN = True
+except ImportError:
+    class MayaQWidgetDockableMixin:
+        """Non-dockable fallback; intentionally not an alias for object."""
+    HAS_MIXIN = False
 
-# Translations
-*.mo
-*.pot
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+TITLE = "TD Perspective Matcher"
+VERSION = "3.1.0"
+OBJECT_NAME = "tdPerspectiveMatcher2026"
+WORKSPACE = OBJECT_NAME + "WorkspaceControl"
+OPTIONS = OBJECT_NAME + "_settings"
+AXES = ("x", "y", "z")
+AXIS_COLORS = {"x": "#ee7070", "y": "#79d28c", "z": "#73a9f5"}
+SENSORS = [("Full frame", 36.0), ("Super 35", 24.89), ("Academy", 22.0),
+           ("APS-C", 22.3), ("Micro 4/3", 17.3), ("Alexa 65", 54.12),
+           ("Custom", None)]
+CAMERA_TYPES = (("Free camera", "free"), ("Aim camera", "aim"),
+                ("Blender-style film gate", "blender"))
+# name, minimum, maximum, default, decimals, step
+COLOR_SPECS = (("exposure", -4., 4., 0., 2, .1),
+               ("brightness", -1., 1., 0., 2, .02),
+               ("contrast", 0., 3., 1., 2, .05),
+               ("gamma", .2, 4., 1., 2, .05),
+               ("saturation", 0., 3., 1., 2, .05),
+               ("opacity", 0., 1., 1., 2, .05))
+COLOR_DEFAULTS = {s[0]: s[3] for s in COLOR_SPECS}
+PREVIEW_EDGE = 1600
+_UI = None
 
-# Flask stuff:
-instance/
-.webassets-cache
 
-# Scrapy stuff:
-.scrapy
+# ---------------------------------------------------------------------------
+# Geometry: pure Python, independent of Maya scene state
+# ---------------------------------------------------------------------------
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
 
-# Sphinx documentation
-docs/_build/
 
-# PyBuilder
-.pybuilder/
-target/
+def cross(a, b):
+    return (a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2],
+            a[0]*b[1] - a[1]*b[0])
 
-# Jupyter Notebook
-.ipynb_checkpoints
 
-# IPython
-profile_default/
-ipython_config.py
+def norm(v):
+    length = math.sqrt(dot(v, v))
+    if length < 1e-12 or not math.isfinite(length):
+        raise ValueError("Degenerate direction. Separate the guides and try again.")
+    return tuple(x / length for x in v)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+def neg(v):
+    return tuple(-x for x in v)
 
-# uv
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+def finite_number(value, label="value"):
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be numeric, not Boolean.")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be finite.")
+    return result
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi/*
-!.pixi/config.toml
+def vanishing_point(lines):
+    """Normalized homogeneous VP in image coordinates (x right, y down).
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    Two nonzero segments are required. Parallel distinct lines produce a point
+    at infinity; coincident lines are rejected instead of inventing a direction.
+    """
+    if len(lines) != 2:
+        return None
+    homogeneous = []
+    for p, q in lines:
+        a, b = p[1] - q[1], q[0] - p[0]
+        length = math.hypot(a, b)
+        if length < 4.0:
+            raise ValueError("Guide segments must be at least 4 image pixels long.")
+        homogeneous.append((a/length, b/length,
+                            (p[0]*q[1] - q[0]*p[1])/length))
+    v = cross(*homogeneous)
+    if abs(v[2]) < 1e-8:
+        length = math.hypot(v[0], v[1])
+        if length < 1e-8:
+            raise ValueError("Two guides overlap. Use separate parallel scene edges.")
+        return (v[0]/length, v[1]/length, 0.0)
+    return (v[0]/v[2], v[1]/v[2], 1.0)
 
-# Celery stuff
-celerybeat-schedule*
-celerybeat.pid
 
-# Redis
-*.rdb
-*.aof
-*.pid
+def estimate_principal_point(vps, width, height):
+    """Orthocenter of three finite orthogonal VPs, expressed center-relative/Y-up."""
+    if any(a not in vps or abs(vps[a][2]) < 1e-12 for a in AXES):
+        raise ValueError("Principal-point estimation needs three finite vanishing points.")
+    a, b, c = [vps[k][:2] for k in AXES]
+    # Intersect altitudes: (P-A).(C-B)=0 and (P-B).(C-A)=0.
+    u = (c[0]-b[0], c[1]-b[1])
+    v = (c[0]-a[0], c[1]-a[1])
+    det = u[0]*v[1] - u[1]*v[0]
+    if abs(det) < 1e-10 * max(1., math.hypot(*u)*math.hypot(*v)):
+        raise ValueError("Vanishing-point triangle is too flat to estimate lens shift.")
+    r, s = dot(a, u), dot(b, v)
+    px, py = (r*v[1]-u[1]*s)/det, (u[0]*s-r*v[0])/det
+    return (px-width*.5, height*.5-py)
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
 
-# ActiveMQ
-activemq-data/
+@dataclass(frozen=True)
+class SolveResult:
+    focal_mm: float
+    focal_px: float
+    hfov: float
+    principal: tuple
+    camera_axes: tuple
+    residual_degrees: float
+    message: str
 
-# SageMath parsed files
-*.sage.py
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+def solve_camera(lines, width, height, sensor_mm=36., principal=(0., 0.),
+                 estimate_pp=False, fixed_focal_mm=None, flips=None):
+    """Fit an orthonormal orientation; reject impossible/underdetermined inputs.
 
-# Spyder project settings
-.spyderproject
-.spyproject
+    Assumes square pixels, no skew, orthogonal scene axes and no distortion.
+    VP signs are ambiguous: flip controls select the positive world directions.
+    """
+    if width <= 0 or height <= 0 or sensor_mm <= 0:
+        raise ValueError("Image dimensions and sensor width must be positive.")
+    vps = {ax: vanishing_point(lines.get(ax, [])) for ax in AXES}
+    vps = {ax: v for ax, v in vps.items() if v is not None}
+    if len(vps) < 2:
+        raise ValueError("Draw two guides on each of at least two world axes.")
+    pp = estimate_principal_point(vps, width, height) if estimate_pp else principal
+    # Homogeneous camera-plane coordinates; infinity remains well-defined.
+    xy = {ax: (v[0]-(width*.5+pp[0])*v[2],
+               (height*.5-pp[1])*v[2]-v[1], v[2]) for ax, v in vps.items()}
+    finite = [v for v in xy.values() if v[2] != 0.]
+    fixed = fixed_focal_mm is not None
+    if fixed:
+        focal = finite_number(fixed_focal_mm, "Focal length") * width / sensor_mm
+        if focal <= 0:
+            raise ValueError("Focal length must be positive.")
+    else:
+        samples = [-(a[0]*b[0]+a[1]*b[1]) for a, b in combinations(finite, 2)]
+        if not samples:
+            raise ValueError("Focal length is underdetermined. Enable Known focal length "
+                             "or provide two finite vanishing points.")
+        if any(v <= 1e-6 for v in samples):
+            raise ValueError("Guides do not describe orthogonal directions for this "
+                             "principal point. Refine the lines, lens shift, or axis labels.")
+        focal = math.sqrt(sum(samples)/len(samples))
+    focal_mm = focal*sensor_mm/width
+    if not 1.0 <= focal_mm <= 10000.0:
+        raise ValueError(f"Implausible focal length ({focal_mm:.3f} mm). Check guides/sensor.")
+    directions = {}
+    for ax, v in xy.items():
+        d = norm((v[0], v[1], -focal*v[2]))
+        directions[ax] = neg(d) if (flips or {}).get(ax, False) else d
+    residual = max(math.degrees(math.asin(min(1., abs(dot(a, b)))))
+                   for a, b in combinations(directions.values(), 2))
+    if residual > 8.0:
+        raise ValueError(f"Orthogonality error is {residual:.2f}°. Refine the guides "
+                         "or correct the focal length/principal point.")
+    if "x" not in directions:
+        directions["x"] = norm(cross(directions["y"], directions["z"]))
+    elif "y" not in directions:
+        directions["y"] = norm(cross(directions["z"], directions["x"]))
+    elif "z" not in directions:
+        directions["z"] = norm(cross(directions["x"], directions["y"]))
+    # A sign choice with negative determinant cannot be a camera rotation.
+    if dot(cross(directions["x"], directions["y"]), directions["z"]) <= 0:
+        raise ValueError("Axis signs form a left-handed frame. Toggle one axis flip.")
+    if np is not None:
+        matrix = np.array([directions[a] for a in AXES], dtype=float).T
+        u, _, vt = np.linalg.svd(matrix)
+        fitted = u @ vt
+        if np.linalg.det(fitted) < 0:
+            u[:, -1] *= -1
+            fitted = u @ vt
+        columns = [tuple(float(x) for x in fitted[:, i]) for i in range(3)]
+    else:
+        x = directions["x"]
+        z = norm(cross(x, directions["y"]))
+        columns = [x, norm(cross(z, x)), z]
+    # World-to-camera columns -> camera-to-world rows (Maya row-vector matrix).
+    camera_axes = tuple(tuple(columns[j][i] for j in range(3)) for i in range(3))
+    message = "Known focal length" if fixed else "Focal length solved from orthogonal VPs"
+    if estimate_pp:
+        message += "; principal point estimated"
+    return SolveResult(focal_mm, focal, math.degrees(2*math.atan(width/(2*focal))),
+                       tuple(pp), camera_axes, residual, message)
 
-# Rope project settings
-.ropeproject
 
-# mkdocs/Zensical documentation
-/site
+# ---------------------------------------------------------------------------
+# Maya scene operations — main thread only
+# ---------------------------------------------------------------------------
+def maya_main_window():
+    pointer = omui.MQtUtil.mainWindow()
+    return wrapInstance(int(pointer), QtWidgets.QWidget) if pointer else None
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
 
-# Pyre type checker
-.pyre/
+@contextmanager
+def undo_chunk(name):
+    cmds.undoInfo(openChunk=True, chunkName=name)
+    try:
+        yield
+    finally:
+        cmds.undoInfo(closeChunk=True)
 
-# pytype static type analyzer
-.pytype/
 
-# Cython debug symbols
-cython_debug/
+def camera_nodes(node):
+    if not node or not cmds.objExists(node):
+        raise ValueError("Select an existing camera.")
+    if cmds.nodeType(node) == "camera":
+        shape = (cmds.ls(node, long=True) or [node])[0]
+        transform = cmds.listRelatives(shape, parent=True, fullPath=True)[0]
+    else:
+        transform = (cmds.ls(node, long=True) or [node])[0]
+        shapes = cmds.listRelatives(transform, shapes=True, type="camera", fullPath=True) or []
+        if not shapes:
+            raise ValueError(f"Not a camera: {node}")
+        shape = shapes[0]
+    return transform, shape
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+def managed_aim(transform):
+    if not cmds.attributeQuery("tpmAimConstraint", node=transform, exists=True):
+        return None
+    connected = cmds.listConnections(transform+".tpmAimConstraint", source=True,
+                                     destination=False, type="aimConstraint") or []
+    return connected[0] if connected else None
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore that
-#   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, you
-#   could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
 
-# Ruff stuff:
-.ruff_cache/
+def create_camera(kind):
+    with undo_chunk("TPM_CreateCamera"):
+        transform, shape = cmds.camera(name="perspectiveMatch_CAM")
+        cmds.setAttr(transform+".translate", 0, 0, 10, type="double3")
+        cmds.setAttr(shape+".filmFit", 1)  # horizontal
+        if kind == "aim":
+            target = cmds.spaceLocator(name="perspectiveMatch_AIM")[0]
+            constraint = cmds.aimConstraint(target, transform, aimVector=(0, 0, -1),
+                                           upVector=(0, 1, 0), worldUpType="vector",
+                                           worldUpVector=(0, 1, 0))[0]
+            cmds.addAttr(transform, longName="tpmAimConstraint", attributeType="message")
+            cmds.connectAttr(constraint+".message", transform+".tpmAimConstraint")
+        if kind == "blender":
+            cmds.setAttr(shape+".overscan", 1.)
+            cmds.setAttr(shape+".displayGateMaskOpacity", .65)
+        cmds.setAttr(shape+".displayResolution", True)
+        cmds.setAttr(shape+".displayGateMask", True)
+    return camera_nodes(transform)[0]
 
-# PyPI configuration file
-.pypirc
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+def find_image_plane(shape):
+    planes = cmds.listConnections(shape+".imagePlane", source=True,
+                                  destination=False, type="imagePlane") or []
+    return planes[0] if planes else None
 
-# Streamlit
-.streamlit/secrets.toml
+
+def apply_plane_color(plane, color):
+    # Maya image-plane attributes cannot reproduce contrast/gamma/saturation.
+    gain = 2.**color["exposure"]
+    cmds.setAttr(plane+".colorGain", gain, gain, gain, type="double3")
+    value = color["brightness"]
+    cmds.setAttr(plane+".colorOffset", value, value, value, type="double3")
+    cmds.setAttr(plane+".alphaGain", color["opacity"])
+
+
+def require_editable(plug, allowed_source=None):
+    if cmds.getAttr(plug, lock=True):
+        raise ValueError(f"Locked attribute: {plug}")
+    sources = cmds.listConnections(plug, source=True, destination=False, plugs=True) or []
+    for source in sources:
+        if allowed_source and cmds.ls(source.split(".")[0], long=True) == cmds.ls(allowed_source, long=True):
+            continue
+        raise ValueError(f"Driven attribute: {plug} ← {source}. Use a new match camera.")
+
+
+def apply_camera(node, solution, width, height, sensor, near, far, image="", color=None, plane_node=None):
+    transform, shape = camera_nodes(node)
+    if cmds.getAttr(shape+".orthographic"):
+        raise ValueError("Orthographic cameras cannot receive a perspective match.")
+    if near <= 0 or far <= near:
+        raise ValueError("Clipping planes must satisfy 0 < near < far.")
+    if image and not os.path.isfile(image):
+        raise ValueError(f"Reference image no longer exists: {image}")
+    if image and plane_node:
+        attached = cmds.listConnections(shape+".imagePlane", source=True,
+                                        destination=False, type="imagePlane") or []
+        full_attached = [p for item in attached for p in (cmds.ls(item, long=True) or [])]
+        if plane_node not in full_attached:
+            raise ValueError("Selected image plane is not attached to the target camera. Refresh Images.")
+    # Pan/zoom, squeeze and pre/post scale would invalidate the pinhole model.
+    calibration = {"horizontalFilmAperture": sensor/25.4,
+                   "verticalFilmAperture": sensor/25.4*height/width,
+                   "focalLength": solution.focal_mm, "filmFit": 1,
+                   # Filmback displacement has the opposite sign to image principal point.
+                   "horizontalFilmOffset": -solution.principal[0]/width*sensor/25.4,
+                   "verticalFilmOffset": -solution.principal[1]/height*(sensor/25.4*height/width),
+                   "nearClipPlane": near, "farClipPlane": far,
+                   "lensSqueezeRatio": 1., "cameraScale": 1.,
+                   "preScale": 1., "postScale": 1., "filmFitOffset": 0.,
+                   "filmTranslateH": 0., "filmTranslateV": 0., "filmRollValue": 0.,
+                   "panZoomEnabled": False, "shakeEnabled": False}
+    aim = managed_aim(transform)
+    targets = cmds.aimConstraint(aim, query=True, targetList=True) if aim else []
+    if aim and len(targets) != 1:
+        raise ValueError("The managed aim camera must have exactly one aim target.")
+    for attr in calibration:
+        require_editable(shape+"."+attr)
+    for channel in ("rotateX", "rotateY", "rotateZ"):
+        require_editable(transform+"."+channel, allowed_source=aim)
+    if aim:
+        for channel in ("translateX", "translateY", "translateZ"):
+            require_editable(targets[0]+"."+channel)
+    else:
+        for attr in ("translateX", "translateY", "translateZ", "scaleX", "scaleY", "scaleZ"):
+            require_editable(transform+"."+attr)
+    position = cmds.xform(transform, query=True, worldSpace=True, translation=True)
+    xa, ya, za = solution.camera_axes
+    plane = None
+    with undo_chunk("TPM_ApplyMatch"):
+        for attr, value in calibration.items():
+            cmds.setAttr(shape+"."+attr, value)
+        if aim:
+            old_target = cmds.xform(targets[0], query=True, worldSpace=True, translation=True)
+            distance = max(1., math.sqrt(sum((a-b)**2 for a, b in zip(position, old_target))))
+            cmds.aimConstraint(aim, edit=True, aimVector=(0, 0, -1), upVector=(0, 1, 0),
+                               worldUpType="vector", worldUpVector=ya, offset=(0, 0, 0))
+            cmds.xform(targets[0], worldSpace=True,
+                       translation=tuple(position[i]-za[i]*distance for i in range(3)))
+        else:
+            matrix = [*xa, 0., *ya, 0., *za, 0., *position, 1.]
+            cmds.xform(transform, worldSpace=True, matrix=matrix)
+        cmds.setAttr(shape+".displayResolution", True)
+        cmds.setAttr(shape+".displayGateMask", True)
+        if image:
+            if not os.path.isfile(image):
+                raise ValueError(f"Reference image no longer exists: {image}")
+            plane = plane_node or find_image_plane(shape)
+            if not plane:
+                _, plane = cmds.imagePlane(camera=shape, fileName=image)
+            else:
+                cmds.setAttr(plane+".imageName", image, type="string")
+            cmds.setAttr(plane+".fit", 1)  # match best; film and image aspects agree
+            cmds.setAttr(plane+".displayOnlyIfCurrent", True)
+            if color is not None:
+                apply_plane_color(plane, color)
+    return transform, plane
+
+
+# ---------------------------------------------------------------------------
+# Image processing — worker uses only QImage/NumPy, never Maya or QPixmap
+# ---------------------------------------------------------------------------
+def correct_image(image, params):
+    if np is None or all(abs(params[k]-COLOR_DEFAULTS[k]) < 1e-8
+                         for k in COLOR_DEFAULTS if k != "opacity"):
+        return image.copy()
+    source = image.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+    w, h = source.width(), source.height()
+    raw = np.frombuffer(source.constBits(), dtype=np.uint8, count=source.sizeInBytes())
+    rgba = raw.reshape(h, source.bytesPerLine())[:, :w*4].reshape(h, w, 4)
+    rgb = rgba[..., :3].astype(np.float32)/255.
+    rgb = rgb*(2.**params["exposure"]) + params["brightness"]
+    rgb = (rgb-.5)*params["contrast"] + .5
+    np.clip(rgb, 0., 1., out=rgb)
+    rgb **= 1./params["gamma"]
+    lum = (rgb @ np.array([.2126, .7152, .0722], dtype=np.float32))[..., None]
+    rgb = lum + (rgb-lum)*params["saturation"]
+    np.clip(rgb, 0., 1., out=rgb)
+    out = np.empty((h, w, 4), dtype=np.uint8)
+    out[..., :3] = (rgb*255.+.5).astype(np.uint8)
+    out[..., 3] = rgba[..., 3]  # preserve source transparency
+    return QtGui.QImage(out.data, w, h, w*4,
+                        QtGui.QImage.Format.Format_RGBA8888).copy()
+
+
+class WorkerSignals(QtCore.QObject):
+    complete = QtCore.Signal(int, object, str)
+
+
+class ColorWorker(QtCore.QRunnable):
+    def __init__(self, generation, image, params):
+        super().__init__()
+        self.generation, self.image, self.params = generation, image, params
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            self.signals.complete.emit(self.generation, correct_image(self.image, self.params), "")
+        except Exception as exc:
+            self.signals.complete.emit(self.generation, None, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Canvas: native-resolution scene coordinates, bounded guide count
+# ---------------------------------------------------------------------------
+class Handle(QtWidgets.QGraphicsEllipseItem):
+    def __init__(self, color, callback):
+        super().__init__(-5, -5, 10, 10)
+        self.callback = callback
+        self.setBrush(QtGui.QColor(color))
+        self.setPen(QtGui.QPen(QtGui.QColor("#f5f5f5"), 1.2))
+        flags = QtWidgets.QGraphicsItem.GraphicsItemFlag
+        self.setFlags(flags.ItemIsMovable | flags.ItemSendsGeometryChanges |
+                      flags.ItemIgnoresTransformations)
+        self.setCursor(QtCore.Qt.CursorShape.SizeAllCursor)
+        self.setZValue(20)
+
+    def itemChange(self, change, value):
+        if change == QtWidgets.QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            if self.callback:
+                self.callback()
+        return super().itemChange(change, value)
+
+
+class Guide:
+    def __init__(self, scene, axis, points, changed):
+        self.scene, self.changed = scene, changed
+        pen = QtGui.QPen(QtGui.QColor(AXIS_COLORS[axis]), 1.8)
+        pen.setCosmetic(True)
+        self.line = scene.addLine(QtCore.QLineF(), pen)
+        self.line.setZValue(10)
+        self.handles = [Handle(AXIS_COLORS[axis], None) for _ in range(2)]
+        for handle, point in zip(self.handles, points):
+            scene.addItem(handle)
+            handle.setPos(*point)
+            handle.callback = self.sync
+        self.sync(notify=False)
+
+    def points(self):
+        return [(h.pos().x(), h.pos().y()) for h in self.handles]
+
+    def sync(self, notify=True):
+        self.line.setLine(QtCore.QLineF(self.handles[0].pos(), self.handles[1].pos()))
+        if notify:
+            self.changed()
+
+    def remove(self):
+        for handle in self.handles:
+            handle.callback = None
+        for item in [self.line, *self.handles]:
+            self.scene.removeItem(item)
+
+
+class Canvas(QtWidgets.QGraphicsView):
+    changed = QtCore.Signal()
+    message = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setScene(QtWidgets.QGraphicsScene(self))
+        self.setRenderHints(QtGui.QPainter.RenderHint.Antialiasing |
+                            QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        self.setBackgroundBrush(QtGui.QColor("#171b22"))
+        self.setTransformationAnchor(self.ViewportAnchor.AnchorUnderMouse)
+        self.setMinimumSize(480, 360)
+        self.width_px = self.height_px = 0
+        self.guides = {ax: [] for ax in AXES}
+        self.axis = "x"
+        self.pixmap = None
+        self.base = None
+        self.original = False
+        self.color = COLOR_DEFAULTS.copy()
+        self.grid = False
+        self.grid_size = 100
+        self.rubber = None
+        self.start = None
+        self.pan = None
+        self.zoom = 1.
+        self.generation = 0
+        self.active = False
+        self.stopping = False
+        self.pool = QtCore.QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+        self.timer = QtCore.QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(90)
+        self.timer.timeout.connect(self.refresh)
+        self.setToolTip("Left drag: draw • Drag endpoint: adjust • Middle drag: pan • Wheel: zoom")
+
+    @staticmethod
+    def read_image(path):
+        reader = QtGui.QImageReader(str(path))
+        # Do not apply EXIF orientation: maintain coordinates used by Maya's plane.
+        reader.setAutoTransform(False)
+        image = reader.read()
+        if image.isNull():
+            raise ValueError("Cannot decode image with this Qt installation: " +
+                             reader.errorString() + "\nConvert EXR/HDR references to PNG/TIFF first.")
+        return image
+
+    def load(self, path, image=None):
+        image = image if image is not None else self.read_image(path)
+        self.cancel_drawing()
+        for guides in self.guides.values():
+            for guide in guides:
+                for handle in guide.handles:
+                    handle.callback = None
+        self.guides = {ax: [] for ax in AXES}
+        self.scene().clear()
+        self.pixmap = None
+        self.width_px, self.height_px = image.width(), image.height()
+        if max(self.width_px, self.height_px) > PREVIEW_EDGE:
+            image = image.scaled(PREVIEW_EDGE, PREVIEW_EDGE,
+                                 QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                                 QtCore.Qt.TransformationMode.SmoothTransformation)
+        self.base = image.copy()
+        self.pixmap = self.scene().addPixmap(QtGui.QPixmap.fromImage(self.base))
+        self.pixmap.setTransformationMode(QtCore.Qt.TransformationMode.SmoothTransformation)
+        self.pixmap.setTransform(QtGui.QTransform.fromScale(
+            self.width_px/self.base.width(), self.height_px/self.base.height()))
+        self.scene().setSceneRect(0, 0, self.width_px, self.height_px)
+        self.schedule()
+        self.fit()
+        self.changed.emit()
+
+    def fit(self):
+        if self.pixmap is not None:
+            self.fitInView(self.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+            self.zoom = 1.
+
+    def line_data(self):
+        return {ax: [guide.points() for guide in self.guides[ax]] for ax in AXES}
+
+    def restore(self, lines):
+        self.clear()
+        for ax in AXES:
+            self.guides[ax] = [Guide(self.scene(), ax, points, self.changed.emit)
+                               for points in lines.get(ax, [])]
+        self.changed.emit()
+
+    def clear(self, axis=None):
+        self.cancel_drawing()
+        for ax in ([axis] if axis else AXES):
+            for guide in self.guides[ax]:
+                guide.remove()
+            self.guides[ax] = []
+        self.changed.emit()
+
+    def set_color(self, params):
+        self.color = params.copy()
+        self.schedule()
+
+    def schedule(self):
+        self.generation += 1
+        self.timer.start()
+
+    def refresh(self):
+        if self.base is None or self.stopping:
+            return
+        if self.original or np is None:
+            self.pixmap.setPixmap(QtGui.QPixmap.fromImage(self.base))
+            self.pixmap.setOpacity(1. if self.original else self.color["opacity"])
+            return
+        if self.active:
+            return  # completion schedules the newest generation, not stale queued jobs
+        self.active = True
+        worker = ColorWorker(self.generation, self.base.copy(), self.color.copy())
+        worker.signals.complete.connect(self.color_ready, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.pool.start(worker)
+
+    @QtCore.Slot(int, object, str)
+    def color_ready(self, generation, image, error):
+        self.active = False
+        if self.stopping:
+            return
+        if generation != self.generation:
+            self.timer.start()
+            return
+        if error:
+            self.message.emit("Preview correction failed: " + error)
+        elif image is not None and self.pixmap is not None:
+            self.pixmap.setPixmap(QtGui.QPixmap.fromImage(image))
+            self.pixmap.setOpacity(1. if self.original else self.color["opacity"])
+
+    def shutdown(self):
+        self.stopping = True
+        self.generation += 1
+        self.timer.stop()
+        self.pool.clear()
+        self.pool.waitForDone()  # bounded 1600px jobs; no Maya/UI calls in worker
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if not self.grid or self.pixmap is None:
+            return
+        painter.save()
+        painter.setClipRect(self.sceneRect())
+        pen = QtGui.QPen(QtGui.QColor(170, 185, 210, 65), 1,
+                         QtCore.Qt.PenStyle.DotLine)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        visible = rect.intersected(self.sceneRect())
+        step = self.grid_size
+        # Keep a bounded number of lines when zoomed out on huge references.
+        while (visible.width()+visible.height())/step > 500:
+            step *= 2
+        for x in range(int(visible.left()//step)*step, int(visible.right())+1, step):
+            painter.drawLine(QtCore.QPointF(x, 0), QtCore.QPointF(x, self.height_px))
+        for y in range(int(visible.top()//step)*step, int(visible.bottom())+1, step):
+            painter.drawLine(QtCore.QPointF(0, y), QtCore.QPointF(self.width_px, y))
+        painter.restore()
+
+    def cancel_drawing(self):
+        if self.rubber is not None:
+            self.scene().removeItem(self.rubber)
+        self.rubber = self.start = None
+
+    def wheelEvent(self, event):
+        if self.pixmap is None or event.angleDelta().y() == 0:
+            return
+        factor = 1.15 if event.angleDelta().y() > 0 else 1/1.15
+        if .05 <= self.zoom*factor <= 60.:
+            self.zoom *= factor
+            self.scale(factor, factor)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.MiddleButton:
+            self.pan = event.position().toPoint()
+            self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            self.cancel_drawing()
+            event.accept()
+            return
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and self.pixmap is not None:
+            point = self.mapToScene(event.position().toPoint())
+            if not isinstance(self.itemAt(event.position().toPoint()), Handle):
+                self.start = point
+                pen = QtGui.QPen(QtGui.QColor(AXIS_COLORS[self.axis]), 1.5,
+                                 QtCore.Qt.PenStyle.DashLine)
+                pen.setCosmetic(True)
+                self.rubber = self.scene().addLine(QtCore.QLineF(point, point), pen)
+                self.rubber.setZValue(12)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.pan is not None:
+            point = event.position().toPoint()
+            delta = point-self.pan
+            self.pan = point
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value()-delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value()-delta.y())
+            event.accept()
+            return
+        if self.rubber is not None:
+            self.rubber.setLine(QtCore.QLineF(self.start, self.mapToScene(event.position().toPoint())))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.MiddleButton:
+            self.pan = None
+            self.unsetCursor()
+            event.accept()
+            return
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and self.rubber is not None:
+            start = self.start
+            end = self.mapToScene(event.position().toPoint())
+            self.cancel_drawing()
+            if QtCore.QLineF(start, end).length() >= 4.:
+                guides = self.guides[self.axis]
+                if len(guides) == 2:
+                    guides.pop(0).remove()
+                guides.append(Guide(self.scene(), self.axis,
+                                    [(start.x(), start.y()), (end.x(), end.y())], self.changed.emit))
+                self.changed.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            self.cancel_drawing()
+            return
+        if event.key() == QtCore.Qt.Key.Key_F:
+            self.fit()
+            return
+        super().keyPressEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Calibration I/O: validate before touching UI; atomic saves
+# ---------------------------------------------------------------------------
+def validate_payload(data):
+    if not isinstance(data, dict):
+        raise ValueError("Calibration must be a JSON object.")
+    version = data.get("version", 4)
+    if version not in (4, 5):
+        raise ValueError(f"Unsupported calibration schema: {version}")
+    size = data.get("image_size")
+    if not isinstance(size, list) or len(size) != 2:
+        raise ValueError("Calibration needs image_size: [width, height].")
+    size = [finite_number(v, "Image size") for v in size]
+    if any(v <= 0 or v != int(v) for v in size):
+        raise ValueError("Image dimensions must be positive integers.")
+    result = {"version": 5, "image_size": [int(v) for v in size],
+              "image": str(data.get("image", "")), "lines": {}, "flips": {}}
+    for ax in AXES:
+        segments = data.get("lines", {}).get(ax, [])
+        if not isinstance(segments, list) or len(segments) > 2:
+            raise ValueError(f"Axis {ax}: expected at most two segments.")
+        clean = []
+        for segment in segments:
+            if not isinstance(segment, (list, tuple)) or len(segment) != 2:
+                raise ValueError(f"Axis {ax}: each segment requires two endpoints.")
+            points = []
+            for p in segment:
+                if not isinstance(p, (list, tuple)) or len(p) != 2:
+                    raise ValueError("Each endpoint must contain two coordinates.")
+                points.append(tuple(finite_number(v, "Guide coordinate") for v in p))
+            if math.dist(*points) < 4.:
+                raise ValueError("Calibration contains a zero-length or too-short guide.")
+            clean.append(points)
+        result["lines"][ax] = clean
+        flip = data.get("flips", {}).get(ax, False)
+        if not isinstance(flip, bool):
+            raise ValueError("Axis flips must be Boolean.")
+        result["flips"][ax] = flip
+    sensor = finite_number(data.get("sensor_mm", 36), "Sensor width")
+    if not 1 <= sensor <= 100:
+        raise ValueError("Sensor width must be between 1 and 100 mm.")
+    result["sensor_mm"] = sensor
+    result["color"] = {}
+    for name, lo, hi, default, _, _ in COLOR_SPECS:
+        value = finite_number(data.get("color", {}).get(name, default), name)
+        if not lo <= value <= hi:
+            raise ValueError(f"{name} is outside its supported range.")
+        result["color"][name] = value
+    settings = data.get("camera_settings", {})
+    near = finite_number(settings.get("near_clip", .1), "Near clip")
+    far = finite_number(settings.get("far_clip", 10000), "Far clip")
+    if not .001 <= near < far <= 1e8:
+        raise ValueError("Invalid clipping-plane range.")
+    shift = settings.get("lens_shift", [0, 0])
+    if not isinstance(shift, (list, tuple)) or len(shift) != 2:
+        raise ValueError("Lens shift must contain two values.")
+    shift = [finite_number(v, "Lens shift") for v in shift]
+    if any(abs(v) > 2 for v in shift):
+        raise ValueError("Lens shift must be between -2 and 2.")
+    focal = finite_number(settings.get("focal_mm", 35), "Known focal length")
+    if not 1 <= focal <= 10000:
+        raise ValueError("Known focal length must be between 1 and 10000 mm.")
+    result["camera_settings"] = {"near_clip": near, "far_clip": far, "lens_shift": shift,
+                                 "focal_mm": focal}
+    for flag in ("known_focal", "estimate_pp"):
+        value = settings.get(flag, False)
+        if not isinstance(value, bool):
+            raise ValueError(f"{flag} must be Boolean.")
+        result["camera_settings"][flag] = value
+    kind = str(data.get("camera_type", "free")).lower()
+    if kind not in {v for _, v in CAMERA_TYPES}:
+        raise ValueError(f"Unsupported camera type: {kind}")
+    result["camera_type"] = kind
+    return result
+
+
+def atomic_json(path, payload):
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(path.parent),
+                                         prefix=".tpm_", suffix=".tmp", delete=False) as stream:
+            temporary = stream.name
+            json.dump(payload, stream, indent=2, ensure_ascii=False, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+# ---------------------------------------------------------------------------
+# Camera / image-plane attribute workspace and manual blockout tools
+# ---------------------------------------------------------------------------
+# All edits are explicit button actions: loading an inspector never writes scene data.
+CAMERA_FIELDS = (
+    ("focalLength", "Focal length · mm", "float", 1., 10000., 1.),
+    ("horizontalFilmAperture", "Film width · mm", "float", .1, 500., 25.4),
+    ("verticalFilmAperture", "Film height · mm", "float", .1, 500., 25.4),
+    ("horizontalFilmOffset", "Film offset X · mm", "float", -500., 500., 25.4),
+    ("verticalFilmOffset", "Film offset Y · mm", "float", -500., 500., 25.4),
+    ("filmFit", "Film fit", "enum", 0, 0, 1.),
+    ("filmFitOffset", "Film-fit offset · inches", "float", -100., 100., 1.),
+    ("lensSqueezeRatio", "Lens squeeze", "float", .01, 100., 1.),
+    ("nearClipPlane", "Near clip · scene units", "float", .001, 1e7, 1.),
+    ("farClipPlane", "Far clip · scene units", "float", .002, 1e8, 1.),
+    ("overscan", "Viewport overscan", "float", .01, 10., 1.),
+    ("cameraScale", "Camera scale", "float", .001, 1000., 1.),
+    ("centerOfInterest", "Center of interest", "float", .001, 1e8, 1.),
+    ("depthOfField", "Depth of field", "bool", 0, 1, 1.),
+    ("focusDistance", "Focus distance · scene units", "float", .001, 1e8, 1.),
+    ("fStop", "F-stop", "float", .1, 128., 1.),
+    ("renderable", "Renderable", "bool", 0, 1, 1.),
+    ("displayResolution", "Resolution gate", "bool", 0, 1, 1.),
+    ("displayFilmGate", "Film gate", "bool", 0, 1, 1.),
+    ("displayGateMask", "Gate mask", "bool", 0, 1, 1.),
+    ("displayGateMaskOpacity", "Gate-mask opacity", "float", 0., 1., 1.),
+    ("displayGateMaskColor", "Gate-mask RGB", "vector", 0., 1., 1.),
+    ("displaySafeAction", "Safe action", "bool", 0, 1, 1.),
+    ("displaySafeTitle", "Safe title", "bool", 0, 1, 1.),
+    ("displayFieldChart", "Field chart", "bool", 0, 1, 1.),
+    ("panZoomEnabled", "2D pan / zoom enabled", "bool", 0, 1, 1.),
+    ("horizontalPan", "2D pan X · inches", "float", -100., 100., 1.),
+    ("verticalPan", "2D pan Y · inches", "float", -100., 100., 1.),
+    ("zoom", "2D zoom", "float", .001, 100., 1.),
+    ("filmRollValue", "Film roll · degrees", "float", -360., 360., 1.),
+)
+PLANE_FIELDS = (
+    ("displayMode", "Display mode", "enum", 0, 0, 1.),
+    ("displayOnlyIfCurrent", "Only in attached camera", "bool", 0, 1, 1.),
+    ("lockedToCamera", "Locked to camera", "bool", 0, 1, 1.),
+    ("fit", "Fit mode", "enum", 0, 0, 1.),
+    ("maintainRatio", "Maintain image ratio", "bool", 0, 1, 1.),
+    ("depth", "Depth · scene units", "float", .001, 1e8, 1.),
+    ("sizeX", "Width", "float", .001, 1e7, 1.),
+    ("sizeY", "Height", "float", .001, 1e7, 1.),
+    ("offsetX", "Offset X", "float", -1e7, 1e7, 1.),
+    ("offsetY", "Offset Y", "float", -1e7, 1e7, 1.),
+    ("alphaGain", "Opacity / alpha gain", "float", 0., 1., 1.),
+    ("colorGain", "Color gain · RGB", "vector", 0., 100., 1.),
+    ("colorOffset", "Color offset · RGB", "vector", -10., 10., 1.),
+    ("useFrameExtension", "Use image sequence", "bool", 0, 1, 1.),
+    ("frameExtension", "Sequence frame", "int", -1000000, 1000000, 1.),
+    ("frameOffset", "Frame offset", "int", -1000000, 1000000, 1.),
+)
+
+
+def enum_choices(node, attr):
+    """Read enum values from Maya rather than assuming version-specific indices."""
+    raw = cmds.attributeQuery(attr, node=node, listEnum=True) or []
+    result, value = [], 0
+    for token in (raw[0].split(":") if raw else []):
+        if "=" in token:
+            token, explicit = token.rsplit("=", 1)
+            value = int(explicit)
+        result.append((token, value))
+        value += 1
+    return result
+
+
+def clean_name(value, fallback):
+    import re
+    value = re.sub(r"[^A-Za-z0-9_]", "_", value.strip())
+    if not value:
+        value = fallback
+    if value[0].isdigit():
+        value = "n_" + value
+    return value
+
+
+def values_equal(a, b):
+    if isinstance(a, (list, tuple)):
+        return isinstance(b, (list, tuple)) and len(a) == len(b) and all(
+            values_equal(x, y) for x, y in zip(a, b))
+    return math.isclose(float(a), float(b), rel_tol=1e-8, abs_tol=1e-8)
+
+
+def read_scene_value(plug, kind):
+    value = cmds.getAttr(plug)
+    if kind == "vector":
+        return tuple(float(v) for v in value[0])
+    return value
+
+
+def preflight_attribute(node, attr):
+    require_editable(node+"."+attr)
+    for child in cmds.attributeQuery(attr, node=node, listChildren=True) or []:
+        require_editable(node+"."+child)
+
+
+def set_scene_value(plug, value, kind):
+    if kind == "vector":
+        cmds.setAttr(plug, *value, type="double3")
+    else:
+        cmds.setAttr(plug, value)
+
+
+def active_model_panel():
+    panel = cmds.getPanel(withFocus=True)
+    if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
+        return panel
+    visible = cmds.getPanel(visiblePanels=True) or []
+    for panel in visible:
+        if cmds.getPanel(typeOf=panel) == "modelPanel":
+            return panel
+    raise ValueError("Open a Maya model viewport first.")
+
+
+def select_attribute_editor(node):
+    if not node or not cmds.objExists(node):
+        raise ValueError("Select an existing node first.")
+    cmds.select(node, replace=True)
+    mel.eval("openAEWindow;")
+
+
+class AttributeForm(QtWidgets.QWidget):
+    """Capability-aware, snapshot-based inspector; unchanged fields are never set."""
+    def __init__(self, specs, parent=None):
+        super().__init__(parent)
+        self.specs = specs
+        self.node = None
+        self.snapshot = {}
+        self.widgets = {}
+        self.labels = {}
+        form = QtWidgets.QFormLayout(self)
+        form.setContentsMargins(0, 0, 0, 0)
+        for attr, label, kind, low, high, factor in specs:
+            if kind == "bool":
+                widget = QtWidgets.QCheckBox()
+            elif kind == "enum":
+                widget = QtWidgets.QComboBox()
+            elif kind == "int":
+                widget = QtWidgets.QSpinBox()
+                widget.setRange(int(low), int(high))
+                widget.setKeyboardTracking(False)
+            elif kind == "vector":
+                widget = QtWidgets.QWidget()
+                row = QtWidgets.QHBoxLayout(widget)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(3)
+                widget.parts = [self.number(low, high) for _ in range(3)]
+                for part in widget.parts:
+                    row.addWidget(part)
+            else:
+                widget = self.number(low, high)
+            self.widgets[attr] = widget
+            text = QtWidgets.QLabel(label)
+            self.labels[attr] = text
+            form.addRow(text, widget)
+        self.setEnabled(False)
+
+    @staticmethod
+    def number(low, high):
+        result = QtWidgets.QDoubleSpinBox()
+        result.setRange(low, high)
+        result.setDecimals(6)
+        result.setSingleStep(.1)
+        result.setKeyboardTracking(False)
+        result.setMinimumWidth(65)
+        return result
+
+    def bind(self, node):
+        self.node, self.snapshot = node, {}
+        self.setEnabled(bool(node))
+        if not node:
+            return
+        for attr, label, kind, low, high, factor in self.specs:
+            widget = self.widgets[attr]
+            available = cmds.attributeQuery(attr, node=node, exists=True)
+            widget.setEnabled(available)
+            self.labels[attr].setEnabled(available)
+            if not available:
+                widget.setToolTip("Attribute is not available on this node/version.")
+                continue
+            value = read_scene_value(node+"."+attr, kind)
+            # Keep out-of-range existing scene values intact unless explicitly changed.
+            self.snapshot[attr] = value
+            if kind == "enum":
+                widget.clear()
+                for name, index in enum_choices(node, attr):
+                    widget.addItem(name, index)
+                if widget.findData(value) < 0:
+                    widget.addItem(str(value), value)
+                widget.setCurrentIndex(widget.findData(value))
+            elif kind == "bool":
+                widget.setChecked(bool(value))
+            elif kind == "vector":
+                for part, channel in zip(widget.parts, value):
+                    part.setRange(min(low, channel), max(high, channel))
+                    part.setValue(channel)
+            else:
+                shown = value*factor
+                widget.setRange(min(low, shown), max(high, shown))
+                widget.setValue(int(shown) if kind == "int" else shown)
+            locked = cmds.getAttr(node+"."+attr, lock=True)
+            widget.setToolTip(f"{node}.{attr}" + (" — LOCKED; changes will be rejected" if locked else ""))
+        # Compare against the displayed rounded value, not its higher-precision source.
+        self.display_snapshot = {attr: self.field_value(attr) for attr in self.snapshot}
+
+    def field_value(self, attr):
+        kind, factor = next((s[2], s[5]) for s in self.specs if s[0] == attr)
+        widget = self.widgets[attr]
+        if kind == "bool":
+            return widget.isChecked()
+        if kind == "enum":
+            return widget.currentData()
+        if kind == "vector":
+            return tuple(w.value() for w in widget.parts)
+        return int(widget.value()) if kind == "int" else widget.value()/factor
+
+    def changes(self):
+        if not self.node or not cmds.objExists(self.node):
+            raise ValueError("Refresh the inspector for an existing node first.")
+        edits = []
+        for attr, _, kind, _, _, _ in self.specs:
+            if attr not in self.snapshot:
+                continue
+            value = self.field_value(attr)
+            if values_equal(value, self.display_snapshot[attr]):
+                continue
+            current = read_scene_value(self.node+"."+attr, kind)
+            if not values_equal(current, self.snapshot[attr]):
+                raise ValueError(f"{attr} changed in Maya since Refresh. Refresh before editing it.")
+            preflight_attribute(self.node, attr)
+            edits.append((attr, value, kind))
+        return edits
+
+    def apply_edits(self, edits):
+        for attr, value, kind in edits:
+            set_scene_value(self.node+"."+attr, value, kind)
+
+
+class WorkspacePanel(QtWidgets.QWidget):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.layout = QtWidgets.QVBoxLayout(self)
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.setSpacing(9)
+
+    def run(self, title, operation):
+        try:
+            operation()
+        except Exception as exc:
+            self.owner.error(title, exc)
+
+    def button(self, title, operation):
+        return self.owner.button(title, lambda: self.run(title, operation))
+
+    def note(self, text):
+        label = QtWidgets.QLabel(text)
+        label.setWordWrap(True)
+        label.setObjectName("muted")
+        self.layout.addWidget(label)
+
+    def group(self, title):
+        group = QtWidgets.QGroupBox(title)
+        layout = QtWidgets.QVBoxLayout(group)
+        self.layout.addWidget(group)
+        return layout
+
+    def camera(self):
+        return camera_nodes(self.owner.cameras.currentData())
+
+    @staticmethod
+    def vector_row(layout, title, default=(0., 0., 0.), low=-1e8, high=1e8):
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel(title))
+        fields = []
+        for axis, value in zip(AXES, default):
+            field = AttributeForm.number(low, high)
+            field.setValue(value)
+            field.setPrefix(axis.upper()+" ")
+            field.setMinimumWidth(65)
+            row.addWidget(field)
+            fields.append(field)
+        layout.addLayout(row)
+        return fields
+
+    @staticmethod
+    def vector(fields):
+        return tuple(field.value() for field in fields)
+
+    @staticmethod
+    def fill_vector(fields, values):
+        for widget, value in zip(fields, values):
+            widget.setValue(value)
+
+
+class CameraWorkspace(WorkspacePanel):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.note("Manual scene editor — independent of Solve. Select a target above, "
+                  "Refresh, edit, then Apply. Native Attribute Editor opens every Maya camera attribute.")
+        tools = QtWidgets.QHBoxLayout()
+        tools.addWidget(self.button("Refresh", self.reload))
+        tools.addWidget(self.button("Look through", self.look_through))
+        tools.addWidget(self.button("Select", lambda: cmds.select(self.camera()[0], replace=True)))
+        self.layout.addLayout(tools)
+        self.layout.addWidget(self.button("Open complete Maya Attribute Editor", lambda: select_attribute_editor(self.camera()[1])))
+        name_row = QtWidgets.QHBoxLayout()
+        self.name = QtWidgets.QLineEdit("matchCamera_CAM")
+        name_row.addWidget(self.name)
+        name_row.addWidget(self.button("Rename", self.rename))
+        self.layout.addLayout(name_row)
+        self.layout.addWidget(self.button("Clone as free camera (no image plane)", self.clone))
+        pose = self.group("Transform · world space")
+        self.position = self.vector_row(pose, "Position")
+        self.rotation = self.vector_row(pose, "Rotation °", low=-36000., high=36000.)
+        actions = QtWidgets.QHBoxLayout()
+        actions.addWidget(self.button("Set position", self.set_position))
+        actions.addWidget(self.button("Set rotation", self.set_rotation))
+        pose.addLayout(actions)
+        lock_row = QtWidgets.QHBoxLayout()
+        lock_row.addWidget(self.button("Lock T / R", lambda: self.lock_pose(True)))
+        lock_row.addWidget(self.button("Unlock T / R", lambda: self.lock_pose(False)))
+        pose.addLayout(lock_row)
+        aim_group = self.group("Managed aim rig · world space")
+        self.aim_position = self.vector_row(aim_group, "Target")
+        self.aim_up = self.vector_row(aim_group, "Up", default=(0., 1., 0.), low=-1., high=1.)
+        aim_group.addWidget(self.button("Apply aim target / up", self.set_aim))
+        self.aim_status = QtWidgets.QLabel("Create an Aim camera in the Match tab to enable aim controls.")
+        self.aim_status.setWordWrap(True)
+        aim_group.addWidget(self.aim_status)
+        self.attrs = AttributeForm(CAMERA_FIELDS)
+        attributes = self.group("Lens · filmback · clipping · display · DOF")
+        attributes.addWidget(self.attrs)
+        attributes.addWidget(self.button("APPLY CHANGED CAMERA ATTRIBUTES", self.apply_attributes))
+        self.note("Film offsets here are Maya filmback offsets in millimeters, not the "
+                  "Match tab's normalized principal-point shifts. Applying a perspective solve "
+                  "will reset conflicting projection settings. DOF support depends on the renderer.")
+        self.layout.addWidget(self.button("Use current lens / gate as Match inputs", self.pull_match_inputs))
+        self.layout.addStretch()
+        self.pose_snapshot = None
+
+    def reload(self):
+        node = self.owner.cameras.currentData()
+        if not node or not cmds.objExists(node):
+            self.attrs.bind(None)
+            self.pose_snapshot = None
+            return
+        transform, shape = camera_nodes(node)
+        self.name.setText(transform.rsplit("|", 1)[-1])
+        pos = cmds.xform(transform, query=True, worldSpace=True, translation=True)
+        rot = cmds.xform(transform, query=True, worldSpace=True, rotation=True)
+        self.fill_vector(self.position, pos)
+        self.fill_vector(self.rotation, rot)
+        self.pose_snapshot = (transform, tuple(pos), tuple(rot))
+        self.attrs.bind(shape)
+        aim = managed_aim(transform)
+        if aim:
+            targets = cmds.aimConstraint(aim, query=True, targetList=True) or []
+            if len(targets) == 1:
+                self.fill_vector(self.aim_position, cmds.xform(targets[0], query=True,
+                                                             worldSpace=True, translation=True))
+                up = cmds.getAttr(aim+".worldUpVector")[0]
+                self.fill_vector(self.aim_up, up)
+                self.aim_status.setText("Managed target: " + targets[0])
+        else:
+            self.aim_status.setText("No managed aim rig. Rotation edits require an undriven camera.")
+
+    def look_through(self):
+        cmds.lookThru(active_model_panel(), self.camera()[0])
+
+    def rename(self):
+        transform, _ = self.camera()
+        with undo_chunk("TPM_RenameCamera"):
+            result = cmds.rename(transform, clean_name(self.name.text(), "matchCamera_CAM"))
+        self.owner.choose_camera(camera_nodes(result)[0])
+
+    def clone(self):
+        source, shape = self.camera()
+        matrix = cmds.xform(source, query=True, worldSpace=True, matrix=True)
+        values = [(attr, read_scene_value(shape+"."+attr, kind), kind)
+                  for attr, _, kind, _, _, _ in CAMERA_FIELDS
+                  if cmds.attributeQuery(attr, node=shape, exists=True)]
+        with undo_chunk("TPM_CloneCamera"):
+            target = create_camera("free")
+            transform, target_shape = camera_nodes(target)
+            cmds.xform(transform, worldSpace=True, matrix=matrix)
+            for attr, value, kind in values:
+                set_scene_value(target_shape+"."+attr, value, kind)
+        self.owner.choose_camera(transform)
+        self.owner.write_log("Cloned supported camera attributes and world matrix; image planes/rigs are not copied.")
+
+    def check_pose(self, rotation=False):
+        transform, _ = self.camera()
+        if not self.pose_snapshot or self.pose_snapshot[0] != transform:
+            raise ValueError("Refresh the camera pose before editing.")
+        current = cmds.xform(transform, query=True, worldSpace=True,
+                             **({"rotation": True} if rotation else {"translation": True}))
+        if not values_equal(current, self.pose_snapshot[2 if rotation else 1]):
+            raise ValueError("Camera pose changed in Maya. Refresh before editing.")
+        if rotation and managed_aim(transform):
+            raise ValueError("Aim-camera rotation is constrained. Edit the managed target / up vector below.")
+        prefix = "rotate" if rotation else "translate"
+        for suffix in "XYZ":
+            require_editable(transform+"."+prefix+suffix)
+        return transform
+
+    def set_position(self):
+        transform = self.check_pose()
+        with undo_chunk("TPM_CameraPosition"):
+            cmds.xform(transform, worldSpace=True, translation=self.vector(self.position))
+        self.reload()
+
+    def set_rotation(self):
+        transform = self.check_pose(rotation=True)
+        with undo_chunk("TPM_CameraRotation"):
+            cmds.xform(transform, worldSpace=True, rotation=self.vector(self.rotation))
+        self.reload()
+
+    def lock_pose(self, state):
+        transform, _ = self.camera()
+        with undo_chunk("TPM_CameraChannelLocks"):
+            for prefix in ("translate", "rotate"):
+                for axis in "XYZ":
+                    cmds.setAttr(transform+"."+prefix+axis, lock=state)
+        self.reload()
+
+    def set_aim(self):
+        transform, _ = self.camera()
+        aim = managed_aim(transform)
+        if not aim:
+            raise ValueError("This is not a tool-managed Aim camera. Create one in Match > Create.")
+        targets = cmds.aimConstraint(aim, query=True, targetList=True) or []
+        if len(targets) != 1:
+            raise ValueError("Aim rig must have exactly one target.")
+        position, up = self.vector(self.aim_position), norm(self.vector(self.aim_up))
+        camera_position = cmds.xform(transform, query=True, worldSpace=True, translation=True)
+        direction = norm(tuple(position[i]-camera_position[i] for i in range(3)))
+        if math.sqrt(dot(cross(direction, up), cross(direction, up))) < 1e-5:
+            raise ValueError("Up vector must not be parallel to the aim direction.")
+        for axis in "XYZ":
+            require_editable(targets[0]+".translate"+axis)
+            require_editable(transform+".rotate"+axis, allowed_source=aim)
+        for attr in ("worldUpVector", "offset", "worldUpType"):
+            preflight_attribute(aim, attr)
+        with undo_chunk("TPM_EditAim"):
+            cmds.aimConstraint(aim, edit=True, worldUpType="vector", worldUpVector=up, offset=(0, 0, 0))
+            cmds.xform(targets[0], worldSpace=True, translation=position)
+        self.reload()
+
+    def apply_attributes(self):
+        _, shape = self.camera()
+        if self.attrs.node != shape:
+            raise ValueError("Refresh the target camera first.")
+        edits = self.attrs.changes()
+        values = {attr: value for attr, value, _ in edits}
+        near = values.get("nearClipPlane", cmds.getAttr(shape+".nearClipPlane"))
+        far = values.get("farClipPlane", cmds.getAttr(shape+".farClipPlane"))
+        if not 0 < near < far:
+            raise ValueError("Clipping planes must satisfy 0 < near < far.")
+        with undo_chunk("TPM_EditCameraAttributes"):
+            self.attrs.apply_edits(edits)
+        self.reload()
+        self.owner.write_log(f"Applied {len(edits)} changed camera attributes. Match inputs were not overwritten.")
+
+    def pull_match_inputs(self):
+        _, shape = self.camera()
+        hfa, vfa = (cmds.getAttr(shape+"."+attr) for attr in
+                    ("horizontalFilmAperture", "verticalFilmAperture"))
+        if hfa <= 0 or vfa <= 0 or not 1 <= hfa*25.4 <= 100:
+            raise ValueError("Camera film width must fit the Match sensor range (1–100 mm).")
+        focal = finite_number(cmds.getAttr(shape+".focalLength"), "Focal length")
+        shift = (-cmds.getAttr(shape+".horizontalFilmOffset")/hfa,
+                 -cmds.getAttr(shape+".verticalFilmOffset")/vfa)
+        near, far = (cmds.getAttr(shape+"."+attr) for attr in ("nearClipPlane", "farClipPlane"))
+        if not 1 <= focal <= 10000 or any(abs(v) > 2 for v in shift):
+            raise ValueError("Current focal length or film offsets exceed the Match input ranges.")
+        if not .001 <= near <= 1e7 or not near < far <= 1e8:
+            raise ValueError("Current clipping planes exceed the Match input ranges.")
+        # Explicit synchronization only; no hidden two-way feedback.
+        self.owner.sensors.setCurrentIndex(len(SENSORS)-1)
+        self.owner.sensor.setValue(hfa*25.4)
+        self.owner.known.setChecked(True)
+        self.owner.focal.setValue(focal)
+        self.owner.estimate.setChecked(False)
+        self.owner.shift_x.setValue(shift[0])
+        self.owner.shift_y.setValue(shift[1])
+        self.owner.near.setValue(near)
+        self.owner.far.setValue(far)
+        self.owner.invalidate()
+        self.owner.write_log("Copied lens, sensor, film offsets and clipping to Match inputs. Image dimensions unchanged.")
+
+
+class ImagePlaneWorkspace(WorkspacePanel):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.note("Manage image planes attached to the selected camera. Multiple planes are "
+                  "supported. Changes are explicit and undoable; no solve is required.")
+        row = QtWidgets.QHBoxLayout()
+        self.planes = QtWidgets.QComboBox()
+        row.addWidget(self.planes, 1)
+        row.addWidget(self.button("Refresh", self.reload))
+        self.layout.addLayout(row)
+        self.file = QtWidgets.QLineEdit()
+        self.file.setReadOnly(True)
+        self.file.setPlaceholderText("No attached image plane selected")
+        self.layout.addWidget(self.file)
+        self.layout.addWidget(self.button("Attach matcher reference as NEW plane", self.attach_reference))
+        self.layout.addWidget(self.button("Browse image + attach NEW plane", self.browse_attach))
+        self.layout.addWidget(self.button("Replace selected plane's image file", self.replace))
+        self.layout.addWidget(self.button("Load selected plane image into Match", self.load_match_reference))
+        self.attrs = AttributeForm(PLANE_FIELDS)
+        attributes = self.group("Plane · fit · depth · placement · color · sequence")
+        attributes.addWidget(self.attrs)
+        attributes.addWidget(self.button("APPLY CHANGED PLANE ATTRIBUTES", self.apply_attributes))
+        self.note("Depth and placement use Maya's native image-plane conventions. Frame Extension "
+                  "may be expression-driven; driven values are protected. Use Native Attribute Editor "
+                  "for coverage, file color space, expressions and additional controls.")
+        self.layout.addWidget(self.button("Open complete image-plane Attribute Editor", lambda: select_attribute_editor(self.plane())))
+        self.layout.addWidget(self.button("Delete selected image plane…", self.delete))
+        self.layout.addStretch()
+        self.planes.currentIndexChanged.connect(self.show_plane)
+
+    def plane(self):
+        node = self.planes.currentData()
+        if not node or not cmds.objExists(node):
+            raise ValueError("Select an attached image plane first.")
+        return node
+
+    def reload(self, selected=None):
+        current = selected if isinstance(selected, str) else self.planes.currentData()
+        blocker = QtCore.QSignalBlocker(self.planes)
+        self.planes.clear()
+        node = self.owner.cameras.currentData()
+        if node and cmds.objExists(node):
+            _, shape = camera_nodes(node)
+            attached = cmds.listConnections(shape+".imagePlane", source=True,
+                                            destination=False, type="imagePlane") or []
+            for plane in dict.fromkeys(attached):
+                full = (cmds.ls(plane, long=True) or [plane])[0]
+                self.planes.addItem(full, full)
+        index = self.planes.findData(current)
+        self.planes.setCurrentIndex(index if index >= 0 else (0 if self.planes.count() else -1))
+        del blocker
+        self.show_plane()
+
+    def show_plane(self, *_):
+        node = self.planes.currentData()
+        self.attrs.bind(node)
+        self.file.setText(cmds.getAttr(node+".imageName") if node else "")
+
+    def browse_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Camera image plane", self.owner.last_dir,
+                                                       "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.exr *.hdr);;All files (*.*)")
+        return path
+
+    def attach(self, path):
+        if not path or not os.path.isfile(path):
+            raise ValueError("Choose an existing image file first.")
+        _, shape = self.camera()
+        with undo_chunk("TPM_AttachImagePlane"):
+            _, plane = cmds.imagePlane(camera=shape, fileName=os.path.abspath(path))
+            cmds.setAttr(plane+".displayOnlyIfCurrent", True)
+            cmds.setAttr(plane+".fit", 1)
+        self.reload((cmds.ls(plane, long=True) or [plane])[0])
+        self.owner.write_log("Attached a new camera image plane: " + path)
+
+    def attach_reference(self):
+        self.attach(self.owner.image_path)
+
+    def browse_attach(self):
+        path = self.browse_file()
+        if path:
+            self.attach(path)
+
+    def replace(self):
+        node = self.plane()
+        path = self.browse_file()
+        if not path:
+            return
+        require_editable(node+".imageName")
+        with undo_chunk("TPM_ReplacePlaneImage"):
+            cmds.setAttr(node+".imageName", os.path.abspath(path), type="string")
+        self.show_plane()
+
+    def load_match_reference(self):
+        path = cmds.getAttr(self.plane()+".imageName")
+        path = os.path.expandvars(os.path.expanduser(path))
+        if not os.path.isabs(path):
+            path = os.path.join(cmds.workspace(query=True, rootDirectory=True), path)
+        if any(self.owner.canvas.guides[a] for a in AXES):
+            answer = QtWidgets.QMessageBox.question(self, "Replace Match reference?",
+                "Loading this image clears the current Match guides. Continue?")
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self.owner.load_reference(path)
+
+    def apply_attributes(self):
+        node = self.plane()
+        if self.attrs.node != node:
+            raise ValueError("Refresh the image-plane inspector first.")
+        edits = self.attrs.changes()
+        with undo_chunk("TPM_EditImagePlane"):
+            self.attrs.apply_edits(edits)
+        self.show_plane()
+        self.owner.write_log(f"Applied {len(edits)} changed image-plane attributes.")
+
+    def delete(self):
+        node = self.plane()
+        answer = QtWidgets.QMessageBox.question(self, "Delete image plane?", "Delete this image-plane shape?\n"+node)
+        if answer == QtWidgets.QMessageBox.StandardButton.Yes:
+            with undo_chunk("TPM_DeleteImagePlane"):
+                cmds.delete(node)  # deliberately never delete a possibly shared parent transform
+            self.reload()
+
+
+def blockout_group():
+    for node in cmds.ls("*.tpmBlockoutRoot", objectsOnly=True, long=True) or []:
+        if cmds.nodeType(node) == "transform" and cmds.getAttr(node+".tpmBlockoutRoot"):
+            return node
+    group = cmds.group(empty=True, name="TPM_BLOCKOUT_GRP")
+    cmds.addAttr(group, longName="tpmBlockoutRoot", attributeType="bool", defaultValue=True)
+    return (cmds.ls(group, long=True) or [group])[0]
+
+
+def blockout_material(rgb):
+    """Reuse only tool-owned shaders; never modify an unrelated name collision."""
+    key = "".join(f"{max(0, min(255, round(v*255))):02x}" for v in rgb)
+    candidate = "TPM_Blockout_"+key+"_MAT"
+    if cmds.objExists(candidate) and cmds.nodeType(candidate) == "lambert" and cmds.attributeQuery(
+            "tpmBlockoutMaterial", node=candidate, exists=True):
+        groups = cmds.listConnections(candidate+".outColor", source=False, destination=True,
+                                      type="shadingEngine") or []
+        if groups:
+            return groups[0]
+    shader = cmds.shadingNode("lambert", asShader=True, name=candidate)
+    cmds.addAttr(shader, longName="tpmBlockoutMaterial", attributeType="bool", defaultValue=True)
+    cmds.setAttr(shader+".color", *rgb, type="double3")
+    group = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=shader+"SG")
+    cmds.connectAttr(shader+".outColor", group+".surfaceShader", force=True)
+    return group
+
+
+def block_selection():
+    selected = cmds.ls(selection=True, long=True, objectsOnly=True) or []
+    result = []
+    for node in selected:
+        if cmds.nodeType(node) in ("mesh", "locator"):
+            node = cmds.listRelatives(node, parent=True, fullPath=True)[0]
+        if cmds.nodeType(node) != "transform":
+            continue
+        shapes = cmds.listRelatives(node, shapes=True, noIntermediate=True, fullPath=True) or []
+        if any(cmds.nodeType(shape) in ("mesh", "locator") for shape in shapes):
+            if node not in result:
+                result.append(node)
+    if not result:
+        raise ValueError("Select mesh or locator transforms in Maya first.")
+    return result
+
+
+def floor_snap(nodes, elevation=0.):
+    axis = 1 if cmds.upAxis(query=True, axis=True) == "y" else 2
+    for node in nodes:
+        for channel in "XYZ":
+            require_editable(node+".translate"+channel)
+    for node in nodes:
+        bounds = cmds.exactWorldBoundingBox(node)
+        position = list(cmds.xform(node, query=True, worldSpace=True, translation=True))
+        position[axis] += elevation-bounds[axis]
+        cmds.xform(node, worldSpace=True, translation=position)
+
+
+class BlockingWorkspace(WorkspacePanel):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.note("Manual blockout in the Maya viewport. Dimensions and positions are in current "
+                  "scene units; no depth or scene scale is inferred from the photograph.")
+        settings = self.group("Primitive settings")
+        row = QtWidgets.QHBoxLayout()
+        self.name = QtWidgets.QLineEdit("block")
+        row.addWidget(QtWidgets.QLabel("Name"))
+        row.addWidget(self.name)
+        settings.addLayout(row)
+        self.dimensions = self.vector_row(settings, "Size", (2., 2., 2.), low=.001, high=1e7)
+        self.position = self.vector_row(settings, "Position")
+        self.rotation = self.vector_row(settings, "Rotation °", low=-36000., high=36000.)
+        self.placement = QtWidgets.QComboBox()
+        self.placement.addItems(["World coordinates", "Selected bounds center", "Along target camera view"])
+        settings.addWidget(self.placement)
+        forward_row = QtWidgets.QHBoxLayout()
+        forward_row.addWidget(QtWidgets.QLabel("Camera distance"))
+        self.distance = AttributeForm.number(.001, 1e8)
+        self.distance.setValue(10.)
+        forward_row.addWidget(self.distance)
+        settings.addLayout(forward_row)
+        self.ground = QtWidgets.QCheckBox("Snap base to ground after placement")
+        self.ground.setChecked(True)
+        settings.addWidget(self.ground)
+        ground_row = QtWidgets.QHBoxLayout()
+        ground_row.addWidget(QtWidgets.QLabel("Ground elevation"))
+        self.elevation = AttributeForm.number(-1e8, 1e8)
+        ground_row.addWidget(self.elevation)
+        settings.addLayout(ground_row)
+        self.color = QtGui.QColor("#a8b3c7")
+        self.color_button = self.button("Blockout color…", self.choose_color)
+        settings.addWidget(self.color_button)
+        primitives = self.group("Create geometry")
+        buttons = QtWidgets.QGridLayout()
+        for i, kind in enumerate(("Cube", "Plane", "Cylinder", "Sphere", "Locator")):
+            buttons.addWidget(self.button(kind, lambda k=kind: self.create(k)), i//3, i%3)
+        primitives.addLayout(buttons)
+        self.note("Size means local X/Y/Z extents before rotation. Plane ignores its normal-axis "
+                  "size. Maya's Y/Z up-axis is respected. Floor snap overrides the final up-axis position.")
+        edit = self.group("Selected mesh / locator tools")
+        edit.addWidget(self.button("Read single selection: world bounds + pose", self.read_selection))
+        edit.addWidget(self.button("Apply position / rotation to single selection", self.place_selection))
+        edit.addWidget(self.button("Resize single mesh to world X/Y/Z extents", self.resize_selection))
+        edit.addWidget(self.button("Snap selected bases to ground", self.snap_selection))
+        edit.addWidget(self.button("Assign blockout color to selected meshes", self.color_selection))
+        edit.addWidget(self.button("Duplicate selected objects", self.duplicate))
+        edit.addWidget(self.button("Move selected into blockout group", self.organize))
+        self.note("Resize edits mesh vertex positions in world space, not topology; flat axes stay "
+                  "flat. It rejects instanced shapes. Use Undo to revert. Pose tools require a single "
+                  "object; duplicate, color, grouping and ground snap support multiple objects.")
+        view = self.group("Viewport & native editing")
+        view.addWidget(self.button("Look through target camera", lambda: cmds.lookThru(active_model_panel(), self.camera()[0])))
+        view.addWidget(self.button("Select blockout group", lambda: cmds.select(blockout_group(), replace=True)))
+        view.addWidget(self.button("Frame selection in active viewport", self.frame_selection))
+        view.addWidget(self.button("Toggle wireframe on shaded", self.toggle_wire))
+        view.addWidget(self.button("Open selected object's Attribute Editor", lambda: select_attribute_editor(block_selection()[0])))
+        self.layout.addStretch()
+
+    def choose_color(self):
+        color = QtWidgets.QColorDialog.getColor(self.color, self, "Blockout material")
+        if color.isValid():
+            self.color = color
+            self.color_button.setStyleSheet("background: "+color.name()+"; color: #151b24;")
+
+    def rgb(self):
+        return self.color.redF(), self.color.greenF(), self.color.blueF()
+
+    def desired_position(self):
+        mode = self.placement.currentIndex()
+        if mode == 1:
+            bounds = cmds.exactWorldBoundingBox(block_selection())
+            return tuple((bounds[i]+bounds[i+3])*.5 for i in range(3))
+        if mode == 2:
+            transform, _ = self.camera()
+            matrix = cmds.xform(transform, query=True, worldSpace=True, matrix=True)
+            backward = norm(tuple(matrix[8:11]))
+            return tuple(matrix[12+i]-backward[i]*self.distance.value() for i in range(3))
+        return self.vector(self.position)
+
+    def create(self, kind):
+        size, position, rotation = self.vector(self.dimensions), self.desired_position(), self.vector(self.rotation)
+        name = clean_name(self.name.text(), "block")+"_"+kind.upper()
+        up_y = cmds.upAxis(query=True, axis=True) == "y"
+        up = (0, 1, 0) if up_y else (0, 0, 1)
+        with undo_chunk("TPM_CreateBlockout"):
+            if kind == "Cube":
+                node = cmds.polyCube(name=name, width=1, height=1, depth=1, constructionHistory=False)[0]
+            elif kind == "Plane":
+                node = cmds.polyPlane(name=name, width=1, height=1, axis=up,
+                                      subdivisionsX=1, subdivisionsY=1, constructionHistory=False)[0]
+            elif kind == "Cylinder":
+                node = cmds.polyCylinder(name=name, radius=.5, height=1, axis=up,
+                                         subdivisionsX=16, subdivisionsY=1, constructionHistory=False)[0]
+            elif kind == "Sphere":
+                node = cmds.polySphere(name=name, radius=.5, subdivisionsX=16,
+                                       subdivisionsY=8, constructionHistory=False)[0]
+            elif kind == "Locator":
+                node = cmds.spaceLocator(name=name)[0]
+            else:
+                raise ValueError("Unsupported primitive.")
+            if kind == "Locator":
+                shape = cmds.listRelatives(node, shapes=True, fullPath=True)[0]
+                cmds.setAttr(shape+".localScale", *size, type="double3")
+            else:
+                cmds.setAttr(node+".scale", *size, type="double3")
+                cmds.makeIdentity(node, apply=True, translate=False, rotate=False, scale=True, normal=0)
+                cmds.sets(node, edit=True, forceElement=blockout_material(self.rgb()))
+            cmds.xform(node, worldSpace=True, translation=position, rotation=rotation)
+            cmds.addAttr(node, longName="tpmBlockout", attributeType="bool", defaultValue=True)
+            node = cmds.parent(node, blockout_group(), absolute=True)[0]
+            node = (cmds.ls(node, long=True) or [node])[0]
+            if self.ground.isChecked():
+                floor_snap([node], self.elevation.value())
+            cmds.select(node, replace=True)
+        self.owner.write_log("Created blockout: " + node)
+
+    def single(self):
+        nodes = block_selection()
+        if len(nodes) != 1:
+            raise ValueError("Select exactly one mesh or locator transform.")
+        return nodes[0]
+
+    def read_selection(self):
+        node = self.single()
+        bounds = cmds.exactWorldBoundingBox(node)
+        self.fill_vector(self.dimensions, tuple(max(.001, bounds[i+3]-bounds[i]) for i in range(3)))
+        self.fill_vector(self.position, cmds.xform(node, query=True, worldSpace=True, translation=True))
+        self.fill_vector(self.rotation, cmds.xform(node, query=True, worldSpace=True, rotation=True))
+        self.placement.setCurrentIndex(0)
+        self.owner.write_log("Read world bounds and transform pose (not unrotated local dimensions).")
+
+    def place_selection(self):
+        node, position = self.single(), self.desired_position()
+        for prefix in ("translate", "rotate"):
+            for axis in "XYZ":
+                require_editable(node+"."+prefix+axis)
+        with undo_chunk("TPM_PlaceBlockout"):
+            cmds.xform(node, worldSpace=True, translation=position, rotation=self.vector(self.rotation))
+            if self.ground.isChecked():
+                floor_snap([node], self.elevation.value())
+
+    def resize_selection(self):
+        node = self.single()
+        shapes = cmds.listRelatives(node, shapes=True, noIntermediate=True, type="mesh", fullPath=True) or []
+        if len(shapes) != 1:
+            raise ValueError("Resize requires a transform with exactly one polygon mesh shape.")
+        if len(cmds.listRelatives(shapes[0], allParents=True, fullPath=True) or []) > 1:
+            raise ValueError("Instanced meshes must be made unique before vertex resizing.")
+        if cmds.referenceQuery(node, isNodeReferenced=True):
+            raise ValueError("Referenced meshes are not resized by this tool.")
+        bounds = cmds.exactWorldBoundingBox(node)
+        extents = [bounds[i+3]-bounds[i] for i in range(3)]
+        factors = [desired/current if current > 1e-8 else 1.
+                   for desired, current in zip(self.vector(self.dimensions), extents)]
+        center = tuple((bounds[i]+bounds[i+3])*.5 for i in range(3))
+        with undo_chunk("TPM_ResizeBlockoutVertices"):
+            cmds.scale(*factors, node+".vtx[*]", relative=True, worldSpace=True, pivot=center)
+            if self.ground.isChecked():
+                floor_snap([node], self.elevation.value())
+        self.owner.write_log("Resized mesh vertices to world bounds; flat axes unchanged.")
+
+    def snap_selection(self):
+        with undo_chunk("TPM_GroundBlockout"):
+            floor_snap(block_selection(), self.elevation.value())
+
+    def color_selection(self):
+        nodes = block_selection()
+        meshes = [n for n in nodes if cmds.listRelatives(n, shapes=True, type="mesh", noIntermediate=True)]
+        if not meshes:
+            raise ValueError("Select at least one polygon mesh.")
+        with undo_chunk("TPM_ColorBlockout"):
+            group = blockout_material(self.rgb())
+            cmds.sets(meshes, edit=True, forceElement=group)
+
+    def duplicate(self):
+        nodes = block_selection()
+        with undo_chunk("TPM_DuplicateBlockout"):
+            result = cmds.duplicate(nodes, returnRootsOnly=True, upstreamNodes=False, inputConnections=False)
+            cmds.select(result, replace=True)
+
+    def organize(self):
+        nodes = block_selection()
+        with undo_chunk("TPM_OrganizeBlockout"):
+            group = blockout_group()
+            for node in nodes:
+                parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+                if parents != [group]:
+                    cmds.parent(node, group, absolute=True)
+
+    def frame_selection(self):
+        if not cmds.ls(selection=True):
+            raise ValueError("Select geometry before framing.")
+        panel = active_model_panel()
+        camera = cmds.modelEditor(panel, query=True, camera=True)
+        cmds.viewFit(camera, allObjects=False)
+
+    def toggle_wire(self):
+        panel = active_model_panel()
+        state = cmds.modelEditor(panel, query=True, wireframeOnShaded=True)
+        cmds.modelEditor(panel, edit=True, wireframeOnShaded=not state)
+
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+STYLE = """
+QWidget#tdPerspectiveMatcher2026 { background: #222731; color: #e0e6ef; }
+QGroupBox { font-weight: 600; border: 1px solid #434b5a; border-radius: 5px;
+            margin-top: 13px; padding: 10px 8px 8px; }
+QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 5px; }
+QPushButton { min-height: 25px; padding: 2px 9px; }
+QPushButton#primary { background: #426da9; color: white; font-weight: bold; min-height: 33px; }
+QPushButton#apply { background: #337a64; color: white; font-weight: bold; min-height: 33px; }
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox { min-height: 23px; }
+QLabel#muted { color: #9daabc; }
+"""
+
+
+class MatcherUI(MayaQWidgetDockableMixin, QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent=parent or maya_main_window())
+        self.setObjectName(OBJECT_NAME)
+        self.setWindowTitle(f"{TITLE}  |  Maya 2026  •  {VERSION}")
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.resize(1280, 860)
+        self.setMinimumSize(960, 620)
+        self.setStyleSheet(STYLE)
+        self.image_path = ""
+        self.last_solve = None
+        self.loading = False
+        self.last_dir = os.path.expanduser("~")
+        self.build()
+        self.restore_preferences()
+        self.refresh_cameras()
+
+    @staticmethod
+    def spin(lo, hi, value, decimals=3, step=.1):
+        widget = QtWidgets.QDoubleSpinBox()
+        widget.setRange(lo, hi)
+        widget.setDecimals(decimals)
+        widget.setSingleStep(step)
+        widget.setValue(value)
+        widget.setKeyboardTracking(False)
+        return widget
+
+    @staticmethod
+    def button(text, callback):
+        button = QtWidgets.QPushButton(text)
+        # clicked(bool) must not leak into optional arguments such as clear(axis).
+        button.clicked.connect(lambda _checked=False: callback())
+        return button
+
+    def build(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 10)
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("PERSPECTIVE / MATCH")
+        title.setStyleSheet("font-size: 21px; font-weight: 700; letter-spacing: 2px;")
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.button("Workflow / Help", self.help))
+        root.addLayout(header)
+        subtitle = QtWidgets.QLabel("CAMERA  /  MATCH  /  IMAGE PLANES  /  MESH BLOCKOUT")
+        subtitle.setObjectName("muted")
+        root.addWidget(subtitle)
+        target_row = QtWidgets.QHBoxLayout()
+        target_row.addWidget(QtWidgets.QLabel("TARGET CAMERA"))
+        self.cameras = QtWidgets.QComboBox()
+        self.cameras.setMinimumContentsLength(22)
+        target_row.addWidget(self.cameras, 1)
+        target_row.addWidget(self.button("Refresh cameras", self.refresh_cameras))
+        target_row.addWidget(self.button("Use selected camera", self.use_selected_camera))
+        root.addLayout(target_row)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+        left = QtWidgets.QWidget()
+        ll = QtWidgets.QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 6, 0)
+        self.canvas = Canvas(self)  # construct before any signal connections reference it
+        self.path = QtWidgets.QLineEdit()
+        self.path.setReadOnly(True)
+        self.path.setPlaceholderText("Load a reference photograph…")
+        file_row = QtWidgets.QHBoxLayout()
+        file_row.addWidget(self.path, 1)
+        file_row.addWidget(self.button("Open image", self.browse))
+        file_row.addWidget(self.button("Fit [F]", self.canvas.fit))
+        ll.addLayout(file_row)
+        ll.addWidget(self.canvas, 1)
+        axes = QtWidgets.QHBoxLayout()
+        self.axis_buttons = QtWidgets.QButtonGroup(self)
+        for i, ax in enumerate(AXES):
+            button = QtWidgets.QPushButton(ax.upper())
+            button.setCheckable(True)
+            button.setChecked(i == 0)
+            button.setStyleSheet(f"QPushButton {{ color: {AXIS_COLORS[ax]}; font-weight: bold; }}"
+                                "QPushButton:checked { border: 2px solid #c3cfdf; }")
+            self.axis_buttons.addButton(button, i)
+            axes.addWidget(button)
+        self.axis_buttons.idClicked.connect(self.axis_changed)
+        axes.addWidget(self.button("Clear axis", lambda: self.canvas.clear(self.canvas.axis)))
+        axes.addWidget(self.button("Clear all", self.canvas.clear))
+        ll.addLayout(axes)
+        footer = QtWidgets.QHBoxLayout()
+        self.counts = QtWidgets.QLabel("X 0/2    Y 0/2    Z 0/2")
+        footer.addWidget(self.counts, 1)
+        self.grid = QtWidgets.QCheckBox("Grid")
+        self.grid.toggled.connect(self.grid_changed)
+        footer.addWidget(self.grid)
+        self.grid_step = QtWidgets.QSpinBox()
+        self.grid_step.setRange(10, 1000)
+        self.grid_step.setValue(100)
+        self.grid_step.setSuffix(" px")
+        self.grid_step.valueChanged.connect(self.grid_changed)
+        footer.addWidget(self.grid_step)
+        ll.addLayout(footer)
+        hint = QtWidgets.QLabel("LMB draw / adjust   •   MMB pan   •   Wheel zoom   •   Esc cancel")
+        hint.setObjectName("muted")
+        ll.addWidget(hint)
+        splitter.addWidget(left)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(390)
+        right = QtWidgets.QWidget()
+        rl = QtWidgets.QVBoxLayout(right)
+        rl.setContentsMargins(5, 0, 0, 0)
+        camera_group = QtWidgets.QGroupBox("01   Camera & calibration")
+        form = QtWidgets.QFormLayout(camera_group)
+        self.kind = QtWidgets.QComboBox()
+        for label, key in CAMERA_TYPES:
+            self.kind.addItem(label, key)
+        creation_row = QtWidgets.QHBoxLayout()
+        creation_row.addWidget(self.kind, 1)
+        creation_row.addWidget(self.button("New", self.new_camera))
+        form.addRow("Create", creation_row)
+        self.sensors = QtWidgets.QComboBox()
+        for label, value in SENSORS:
+            self.sensors.addItem(label, value)
+        self.sensor = self.spin(1, 100, 36)
+        self.sensor.setSuffix(" mm")
+        self.sensor.setEnabled(False)
+        sensor_row = QtWidgets.QHBoxLayout()
+        sensor_row.addWidget(self.sensors)
+        sensor_row.addWidget(self.sensor)
+        form.addRow("Sensor width", sensor_row)
+        self.known = QtWidgets.QCheckBox("Known focal length")
+        self.focal = self.spin(1, 10000, 35, 3, 1)
+        self.focal.setSuffix(" mm")
+        self.focal.setEnabled(False)
+        known_row = QtWidgets.QHBoxLayout()
+        known_row.addWidget(self.known)
+        known_row.addWidget(self.focal)
+        form.addRow(known_row)
+        self.estimate = QtWidgets.QCheckBox("Estimate lens shift from 3 finite VPs")
+        form.addRow(self.estimate)
+        self.shift_x = self.spin(-2, 2, 0, 5, .001)
+        self.shift_y = self.spin(-2, 2, 0, 5, .001)
+        shift_row = QtWidgets.QHBoxLayout()
+        shift_row.addWidget(self.shift_x)
+        shift_row.addWidget(self.shift_y)
+        form.addRow("Shift X / Y", shift_row)
+        self.shift_x.setToolTip("Principal-point offset / image width. Positive = right.")
+        self.shift_y.setToolTip("Principal-point offset / image height. Positive = up.")
+        flip_row = QtWidgets.QHBoxLayout()
+        self.flips = {}
+        for ax in AXES:
+            check = QtWidgets.QCheckBox("Flip "+ax.upper())
+            check.toggled.connect(self.invalidate)
+            flip_row.addWidget(check)
+            self.flips[ax] = check
+        form.addRow(flip_row)
+        self.near = self.spin(.001, 1e7, .1, 3, .1)
+        self.far = self.spin(.002, 1e8, 10000, 1, 100)
+        clip_row = QtWidgets.QHBoxLayout()
+        clip_row.addWidget(self.near)
+        clip_row.addWidget(self.far)
+        form.addRow("Clip near / far", clip_row)
+        rl.addWidget(camera_group)
+        self.sensors.currentIndexChanged.connect(self.sensor_changed)
+        self.known.toggled.connect(self.known_changed)
+        self.estimate.toggled.connect(self.estimate_changed)
+        for widget in (self.sensor, self.focal, self.shift_x, self.shift_y):
+            widget.valueChanged.connect(self.invalidate)
+        color_group = QtWidgets.QGroupBox("02   Reference preview")
+        cf = QtWidgets.QFormLayout(color_group)
+        self.colors = {}
+        for name, lo, hi, default, decimals, step in COLOR_SPECS:
+            widget = self.spin(lo, hi, default, decimals, step)
+            widget.valueChanged.connect(self.color_changed)
+            if np is None and name != "opacity":
+                widget.setEnabled(False)
+            self.colors[name] = widget
+            cf.addRow(name.capitalize(), widget)
+        color_row = QtWidgets.QHBoxLayout()
+        self.original = QtWidgets.QCheckBox("Original")
+        self.original.toggled.connect(self.original_changed)
+        color_row.addWidget(self.original)
+        color_row.addWidget(self.button("Reset", self.reset_color))
+        cf.addRow(color_row)
+        self.push_color = QtWidgets.QCheckBox("Apply exposure / brightness / opacity to plane")
+        self.push_color.setChecked(True)
+        cf.addRow(self.push_color)
+        note = QtWidgets.QLabel("Preview is display-space only. Gamma, contrast and saturation "
+                               "are not transferred to Maya's image plane.")
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        cf.addRow(note)
+        if np is None:
+            cf.addRow(QtWidgets.QLabel("NumPy unavailable: preview opacity only."))
+        rl.addWidget(color_group)
+        solve_group = QtWidgets.QGroupBox("03   Solve & apply")
+        sl = QtWidgets.QVBoxLayout(solve_group)
+        solve_button = self.button("SOLVE CAMERA", self.solve)
+        solve_button.setObjectName("primary")
+        sl.addWidget(solve_button)
+        self.result = QtWidgets.QLabel("Load a reference, then draw two guides per axis.")
+        self.result.setWordWrap(True)
+        self.result.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        sl.addWidget(self.result)
+        self.plane = QtWidgets.QCheckBox("Create / update camera image plane")
+        self.plane.setChecked(True)
+        self.look = QtWidgets.QCheckBox("Look through camera after apply")
+        self.look.setChecked(True)
+        self.resolution = QtWidgets.QCheckBox("Set render resolution to reference size")
+        self.resolution.setToolTip("Changes scene-global render settings; pixel aspect becomes 1.")
+        sl.addWidget(self.plane)
+        sl.addWidget(self.look)
+        sl.addWidget(self.resolution)
+        apply_button = self.button("APPLY TO TARGET CAMERA", self.apply)
+        apply_button.setObjectName("apply")
+        sl.addWidget(apply_button)
+        sl.addWidget(self.button("Update image-plane color", self.update_plane))
+        json_row = QtWidgets.QHBoxLayout()
+        json_row.addWidget(self.button("Save calibration", self.save_json))
+        json_row.addWidget(self.button("Load calibration", self.load_json))
+        sl.addLayout(json_row)
+        rl.addWidget(solve_group)
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(200)
+        self.log.setMaximumHeight(130)
+        rl.addWidget(self.log)
+        rl.addStretch()
+        scroll.setWidget(right)
+        self.workspace_tabs = QtWidgets.QTabWidget()
+        self.workspace_tabs.setMinimumWidth(400)
+        self.workspace_tabs.setMaximumWidth(560)
+        self.workspace_tabs.addTab(scroll, "Match")
+        splitter.addWidget(self.workspace_tabs)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([800, 460])
+        self.status = QtWidgets.QLabel(f"Ready  |  Python {sys.version_info.major}.{sys.version_info.minor}"
+                                     f"  |  NumPy {getattr(np, '__version__', 'not installed')}")
+        self.status.setObjectName("muted")
+        root.addWidget(self.status)
+        self.canvas.changed.connect(self.guides_changed)
+        self.canvas.message.connect(self.write_log)
+        self.camera_workspace = CameraWorkspace(self)
+        self.image_workspace = ImagePlaneWorkspace(self)
+        self.blocking_workspace = BlockingWorkspace(self)
+        for title, panel in (("Camera", self.camera_workspace),
+                             ("Images", self.image_workspace),
+                             ("Blockout", self.blocking_workspace)):
+            page = QtWidgets.QScrollArea()
+            page.setWidgetResizable(True)
+            page.setWidget(panel)
+            self.workspace_tabs.addTab(page, title)
+        self.cameras.currentIndexChanged.connect(self.target_changed)
+
+    def choose_camera(self, node):
+        self.refresh_cameras()
+        self.cameras.setCurrentIndex(self.cameras.findData(node))
+        self.target_changed()
+
+    def target_changed(self, *_):
+        if hasattr(self, "camera_workspace"):
+            self.camera_workspace.run("Refresh camera", self.camera_workspace.reload)
+            self.image_workspace.run("Refresh image planes", self.image_workspace.reload)
+
+    def use_selected_camera(self):
+        try:
+            selected = cmds.ls(selection=True, long=True) or []
+            if len(selected) != 1:
+                raise ValueError("Select exactly one camera transform or shape in Maya.")
+            transform, _ = camera_nodes(selected[0])
+            if cmds.getAttr(camera_nodes(transform)[1]+".orthographic"):
+                raise ValueError("Choose a perspective camera, not an orthographic view.")
+            self.choose_camera(transform)
+        except Exception as exc:
+            self.error("Use selected camera", exc)
+
+    def write_log(self, message):
+        self.log.appendPlainText(message)
+        self.status.setText(message)
+
+    def error(self, title, exc):
+        self.write_log(f"{title}: {exc}")
+        QtWidgets.QMessageBox.warning(self, title, str(exc))
+
+    def axis_changed(self, index):
+        self.canvas.cancel_drawing()
+        self.canvas.axis = AXES[index]
+
+    def grid_changed(self, *_):
+        self.canvas.grid = self.grid.isChecked()
+        self.canvas.grid_size = self.grid_step.value()
+        self.canvas.viewport().update()
+
+    def invalidate(self, *_):
+        self.last_solve = None
+        if not self.loading:
+            self.result.setText("Calibration changed. Solve again before applying.")
+
+    def guides_changed(self):
+        self.counts.setText("    ".join(f"{a.upper()} {len(self.canvas.guides[a])}/2" for a in AXES))
+        self.invalidate()
+
+    def sensor_changed(self, index):
+        value = self.sensors.itemData(index)
+        self.sensor.setEnabled(value is None)
+        if value is not None:
+            self.sensor.setValue(value)
+        self.invalidate()
+
+    def known_changed(self, checked):
+        self.focal.setEnabled(checked)
+        self.invalidate()
+
+    def estimate_changed(self, checked):
+        self.shift_x.setEnabled(not checked)
+        self.shift_y.setEnabled(not checked)
+        self.invalidate()
+
+    def color_values(self):
+        return {name: widget.value() for name, widget in self.colors.items()}
+
+    def color_changed(self, *_):
+        self.canvas.set_color(self.color_values())
+
+    def reset_color(self):
+        for name, widget in self.colors.items():
+            blocker = QtCore.QSignalBlocker(widget)
+            widget.setValue(COLOR_DEFAULTS[name])
+            del blocker
+        self.color_changed()
+
+    def original_changed(self, checked):
+        self.canvas.original = checked
+        self.canvas.schedule()
+
+    def refresh_cameras(self):
+        selected = self.cameras.currentData()
+        blocker = QtCore.QSignalBlocker(self.cameras)
+        self.cameras.clear()
+        for shape in cmds.ls(type="camera", long=True) or []:
+            if cmds.getAttr(shape+".orthographic"):
+                continue
+            transform = cmds.listRelatives(shape, parent=True, fullPath=True)[0]
+            self.cameras.addItem(transform, transform)
+        index = self.cameras.findData(selected)
+        if index < 0:
+            index = self.cameras.findData("|persp")
+        self.cameras.setCurrentIndex(max(0, index))
+        del blocker
+        self.target_changed()
+
+    def new_camera(self):
+        try:
+            camera = create_camera(self.kind.currentData())
+            self.choose_camera(camera)
+            self.write_log("Created " + camera)
+        except Exception as exc:
+            self.error("Create camera failed", exc)
+
+    def load_reference(self, path):
+        self.canvas.load(path)
+        self.image_path = os.path.abspath(path)
+        self.path.setText(self.image_path)
+        self.last_dir = os.path.dirname(self.image_path)
+        self.write_log(f"Loaded {self.canvas.width_px} × {self.canvas.height_px}: {path}")
+        QtCore.QTimer.singleShot(0, self.canvas.fit)
+
+    def browse(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Reference image", self.last_dir,
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp);;All files (*.*)")
+        if path:
+            try:
+                self.load_reference(path)
+            except Exception as exc:
+                self.error("Image load failed", exc)
+
+    def solve(self):
+        self.last_solve = None
+        try:
+            w, h = self.canvas.width_px, self.canvas.height_px
+            if not w:
+                raise ValueError("Load a reference image first.")
+            solution = solve_camera(self.canvas.line_data(), w, h, self.sensor.value(),
+                                    (self.shift_x.value()*w, self.shift_y.value()*h),
+                                    self.estimate.isChecked(),
+                                    self.focal.value() if self.known.isChecked() else None,
+                                    {a: c.isChecked() for a, c in self.flips.items()})
+            self.last_solve = solution
+            self.result.setText(f"{solution.focal_mm:.3f} mm   /   HFOV {solution.hfov:.2f}°\n"
+                                f"Orthogonality error: {solution.residual_degrees:.3f}°\n"
+                                f"Principal point: {solution.principal[0]:.2f}, "
+                                f"{solution.principal[1]:.2f} px (center-relative)\n"
+                                f"{solution.message}\nPosition and scene scale are unchanged.")
+            self.write_log(f"Solved: {solution.focal_mm:.3f} mm; "
+                           f"error {solution.residual_degrees:.3f}°")
+            return True
+        except Exception as exc:
+            self.result.setText("Solve failed. " + str(exc))
+            self.error("Solve failed", exc)
+            return False
+
+    def apply(self):
+        # Always re-solve: never apply a stale calibration.
+        if not self.solve():
+            return
+        try:
+            camera = self.cameras.currentData()
+            w, h = self.canvas.width_px, self.canvas.height_px
+            if self.resolution.isChecked():
+                for attr in ("width", "height", "pixelAspect", "deviceAspectRatio"):
+                    require_editable("defaultResolution."+attr)
+            with undo_chunk("TPM_Apply"):
+                transform, _ = apply_camera(
+                    camera, self.last_solve, w, h, self.sensor.value(),
+                    self.near.value(), self.far.value(),
+                    self.image_path if self.plane.isChecked() else "",
+                    self.color_values() if self.push_color.isChecked() else None,
+                    plane_node=self.image_workspace.planes.currentData())
+                if self.resolution.isChecked():
+                    cmds.setAttr("defaultResolution.width", w)
+                    cmds.setAttr("defaultResolution.height", h)
+                    cmds.setAttr("defaultResolution.pixelAspect", 1.)
+                    cmds.setAttr("defaultResolution.deviceAspectRatio", w/h)
+            if self.look.isChecked():
+                panel = cmds.getPanel(withFocus=True)
+                if not panel or cmds.getPanel(typeOf=panel) != "modelPanel":
+                    panels = cmds.getPanel(type="modelPanel") or []
+                    panel = panels[0] if panels else None
+                if panel:
+                    cmds.lookThru(panel, transform)
+            self.target_changed()
+            self.write_log("Applied to " + transform + " — undoable")
+            if not self.resolution.isChecked():
+                self.write_log("Render resolution unchanged. Match its aspect to the reference before rendering.")
+        except Exception as exc:
+            self.error("Apply failed", str(exc)+"\nIf scene changes occurred, undo TPM_Apply.")
+
+    def update_plane(self):
+        try:
+            _, shape = camera_nodes(self.cameras.currentData())
+            plane = self.image_workspace.planes.currentData() or find_image_plane(shape)
+            if not plane:
+                raise ValueError("Target camera has no image plane. Attach one in Images or Apply first.")
+            with undo_chunk("TPM_PlaneColor"):
+                apply_plane_color(plane, self.color_values())
+            self.image_workspace.reload(plane)
+            self.write_log("Updated image-plane exposure / brightness / opacity.")
+        except Exception as exc:
+            self.error("Image-plane update failed", exc)
+
+    def payload(self):
+        return {"version": 5, "tool_version": VERSION, "image": self.image_path,
+                "image_size": [self.canvas.width_px, self.canvas.height_px],
+                "sensor_mm": self.sensor.value(), "camera_type": self.kind.currentData(),
+                "lines": self.canvas.line_data(),
+                "flips": {ax: widget.isChecked() for ax, widget in self.flips.items()},
+                "color": self.color_values(),
+                "camera_settings": {"near_clip": self.near.value(), "far_clip": self.far.value(),
+                                    "lens_shift": [self.shift_x.value(), self.shift_y.value()],
+                                    "known_focal": self.known.isChecked(), "focal_mm": self.focal.value(),
+                                    "estimate_pp": self.estimate.isChecked()}}
+
+    def save_json(self):
+        if not self.image_path:
+            self.error("Save calibration", "Load a reference image first.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save calibration", os.path.join(self.last_dir, "perspective_match.json"), "JSON (*.json)")
+        if path:
+            try:
+                if not path.lower().endswith(".json"):
+                    path += ".json"
+                payload = self.payload()
+                validate_payload(payload)
+                atomic_json(path, payload)
+                self.write_log("Saved " + path)
+            except Exception as exc:
+                self.error("Save failed", exc)
+
+    def load_json(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load calibration", self.last_dir, "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as stream:
+                payload = validate_payload(json.load(stream))
+            image_path = payload["image"]
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(os.path.dirname(path), image_path)
+            if not os.path.isfile(image_path):
+                image_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self, "Locate missing reference image", os.path.dirname(path), "All files (*.*)")
+                if not image_path:
+                    return
+            # Decode and validate dimensions BEFORE replacing current calibration.
+            image = Canvas.read_image(image_path)
+            if [image.width(), image.height()] != payload["image_size"]:
+                raise ValueError("Reference dimensions differ from the saved calibration. "
+                                 "Select the original image; guides will not be rescaled silently.")
+            self.loading = True
+            try:
+                self.canvas.load(image_path, image=image)
+                self.image_path = os.path.abspath(image_path)
+                self.path.setText(self.image_path)
+                self.sensors.setCurrentIndex(len(SENSORS)-1)
+                self.sensor.setValue(payload["sensor_mm"])
+                self.kind.setCurrentIndex(self.kind.findData(payload["camera_type"]))
+                settings = payload["camera_settings"]
+                self.near.setValue(settings["near_clip"])
+                self.far.setValue(settings["far_clip"])
+                self.shift_x.setValue(settings["lens_shift"][0])
+                self.shift_y.setValue(settings["lens_shift"][1])
+                self.known.setChecked(settings["known_focal"])
+                self.focal.setValue(settings["focal_mm"])
+                self.estimate.setChecked(settings["estimate_pp"])
+                for ax in AXES:
+                    self.flips[ax].setChecked(payload["flips"][ax])
+                for name, widget in self.colors.items():
+                    widget.setValue(payload["color"][name])
+                self.color_changed()
+                self.canvas.restore(payload["lines"])
+                self.last_solve = None
+            finally:
+                self.loading = False
+            self.result.setText("Calibration loaded. Solve to validate before applying.")
+            self.last_dir = os.path.dirname(path)
+            self.write_log("Loaded " + path)
+            QtCore.QTimer.singleShot(0, self.canvas.fit)
+        except Exception as exc:
+            self.error("Calibration load failed", exc)
+
+    def restore_preferences(self):
+        try:
+            if not cmds.optionVar(exists=OPTIONS):
+                return
+            data = json.loads(cmds.optionVar(query=OPTIONS))
+            self.last_dir = str(data.get("last_dir", self.last_dir))
+            sensor = finite_number(data.get("sensor", 36))
+            if 1 <= sensor <= 100:
+                self.sensors.setCurrentIndex(len(SENSORS)-1)
+                self.sensor.setValue(sensor)
+        except (ValueError, TypeError, RuntimeError):
+            pass  # preferences are best-effort, never a launch blocker
+
+    def closeEvent(self, event):
+        self.canvas.shutdown()
+        try:
+            cmds.optionVar(stringValue=(OPTIONS, json.dumps({"last_dir": self.last_dir,
+                                                           "sensor": self.sensor.value()})))
+        except RuntimeError:
+            pass
+        super().closeEvent(event)
+
+    def help(self):
+        QtWidgets.QMessageBox.information(self, TITLE, """
+1. Load an undistorted rectilinear photograph (PNG/TIFF recommended).
+2. Mark two different scene edges parallel to world X; repeat for Y and/or Z.
+   The drawn image segments should converge, not be parallel on screen.
+3. Choose the physical sensor width. Solve, then inspect the focal length.
+4. Use axis flips to choose positive world directions. Three-axis signs must
+   form a right-handed frame. Lens shift can be entered or estimated from 3 VPs.
+5. Create a new camera (recommended), then Apply. Existing position is preserved.
+   Place the camera and scale/translate your scene manually to align the origin.
+
+Known focal length handles underdetermined cases, including VPs at infinity.
+Free and Blender-style options are standard Maya pinhole cameras; the latter is
+only a film-gate preset. Aim mode creates a managed target and aim constraint.
+Existing animated/driven rotations are not overwritten. Render-size changes
+are opt-in and scene-global. Errors after a partial apply can be undone.
+
+Camera tab: edit the scene camera, filmback, display, DOF and aim rig directly.
+Images tab: attach/replace/edit multiple camera image planes without solving.
+Blockout tab: create/edit/color/organize mesh primitives in current scene units.
+Open Native Attribute Editor for the complete Maya node controls. Save your
+Maya scene (.ma/.mb) to retain camera rigs, image planes, materials and meshes.
+Calibration JSON stores Match inputs only, not the entire scene workspace.
+
+No automatic translation solve, lens-distortion solve, USD, VR, stereo, panorama,
+automatic edge detection, or batch calibration is implied. Preview corrections
+are display-space adjustments, not an OCIO color-management replacement.
+""".strip())
+
+
+# ---------------------------------------------------------------------------
+# Launch / shelf
+# ---------------------------------------------------------------------------
+def _delete_existing():
+    global _UI
+    if _UI is not None:
+        try:
+            _UI.close()
+        except RuntimeError:
+            pass
+        _UI = None
+    app = QtWidgets.QApplication.instance()
+    if app:
+        for widget in app.allWidgets():
+            try:
+                if widget.objectName() == OBJECT_NAME:
+                    widget.close()
+            except RuntimeError:
+                pass
+    if cmds.workspaceControl(WORKSPACE, exists=True):
+        cmds.deleteUI(WORKSPACE)
+
+
+def _launch(dockable):
+    global _UI
+    _delete_existing()
+    _UI = MatcherUI()
+    if dockable and HAS_MIXIN:
+        _UI.show(dockable=True, retain=False)
+    else:
+        _UI.setWindowFlag(QtCore.Qt.WindowType.Window, True)
+        _UI.show()
+    _UI.raise_()
+    _UI.activateWindow()
+    return _UI
+
+
+def show(dockable=True):
+    """Return the UI. Marshal off-main-thread requests to Maya's main thread."""
+    def launch_checked():
+        if cmds.about(batch=True):
+            cmds.warning(TITLE + ": UI is unavailable in Maya batch mode.")
+            return None
+        if int(str(cmds.about(version=True)).split(".")[0]) < 2026:
+            raise RuntimeError("This build requires Maya 2026+ with PySide6.")
+        return _launch(dockable)
+    return maya.utils.executeInMainThreadWithResult(launch_checked)
+
+
+def install_shelf_button():
+    top = mel.eval("$tpmShelf = $gShelfTopLevel")
+    shelf = cmds.tabLayout(top, query=True, selectTab=True)
+    if not shelf:
+        raise RuntimeError("Select a shelf tab before installing the button.")
+    return cmds.shelfButton(parent=shelf, label="PerspMatch", annotation=TITLE,
+                            image="camera.png", sourceType="python",
+                            command="import td_perspective_matcher_maya2026 as tpm; tpm.show()")
+
+
+if __name__ == "__main__":
+    show()
